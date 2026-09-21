@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Field Log — Pet Gesture Reader</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1c1f1b;
+    --panel: #23281f;
+    --line: #3f4a3d;
+    --moss: #7fa373;
+    --moss-light: #9bc28f;
+    --amber: #e8a33d;
+    --paper: #f2efe9;
+    --muted: #8a9282;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--paper);
+    font-family: 'Space Grotesk', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+  .sheet {
+    width: 100%;
+    max-width: 960px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.45);
+  }
+  .masthead {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--line);
+  }
+  .masthead h1 {
+    font-size: 20px;
+    letter-spacing: 0.02em;
+    margin: 0;
+    font-weight: 700;
+  }
+  .masthead h1 span { color: var(--moss); }
+  .masthead .meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  /* Mode Switcher Tabs */
+  .tabs-bar {
+    display: flex;
+    background: #191c18;
+    border-bottom: 1px solid var(--line);
+  }
+  .tab-btn {
+    flex: 1;
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 13px 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    margin: 0;
+    border-radius: 0;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .tab-btn:hover {
+    color: var(--paper);
+    background: rgba(127, 163, 115, 0.06);
+  }
+  .tab-btn.active {
+    color: var(--amber);
+    border-bottom: 2px solid var(--amber);
+    background: rgba(232, 163, 61, 0.08);
+    font-weight: 700;
+  }
+
+  .banner {
+    margin: 0; padding: 10px 28px; background: #3a2f1a; border-bottom: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--amber);
+  }
+  .gesture-banner {
+    padding: 16px 28px;
+    border-bottom: 1px solid var(--line);
+    font-family: 'JetBrains Mono', monospace;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .gesture-banner .eyebrow {
+    font-size: 10.5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 4px;
+  }
+  .gesture-banner .value {
+    font-size: 22px;
+    color: var(--amber);
+    font-weight: 500;
+  }
+  .gesture-banner .mode-pill {
+    font-size: 10px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: #1a1e19;
+    border: 1px solid var(--line);
+    color: var(--moss);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .body {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr;
+    gap: 0;
+  }
+  @media (max-width: 750px) {
+    .body { grid-template-columns: 1fr; }
+  }
+
+  .cam-wrap {
+    position: relative;
+    background: #000;
+    border-right: 1px solid var(--line);
+    min-height: 380px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+  }
+  video, img.feed-media {
+    width: 100%;
+    height: 100%;
+    max-height: 480px;
+    object-fit: contain;
+    display: block;
+    background: #000;
+  }
+
+  .tag {
+    position: absolute;
+    left: 16px;
+    bottom: 16px;
+    background: rgba(28, 31, 27, 0.9);
+    border: 1px solid var(--moss);
+    padding: 8px 14px;
+    border-radius: 3px;
+    font-family: 'JetBrains Mono', monospace;
+    pointer-events: none;
+    z-index: 10;
+  }
+  .tag .label { font-size: 18px; font-weight: 500; color: var(--amber); }
+  .tag .conf { font-size: 11px; color: var(--muted); }
+
+  /* Upload Dropzone */
+  .dropzone-container {
+    width: 100%;
+    height: 100%;
+    min-height: 380px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 24px;
+    text-align: center;
+    border: 2px dashed var(--line);
+    transition: all 0.25s ease;
+    cursor: pointer;
+    background: #171a15;
+  }
+  .dropzone-container:hover, .dropzone-container.drag-active {
+    border-color: var(--moss);
+    background: rgba(127, 163, 115, 0.08);
+  }
+  .dz-icon {
+    font-size: 44px;
+    margin-bottom: 14px;
+    filter: drop-shadow(0 2px 8px rgba(0,0,0,0.5));
+  }
+  .dz-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--paper);
+    margin-bottom: 6px;
+  }
+  .dz-sub {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    margin-bottom: 14px;
+  }
+  .dz-sub .browse-link {
+    color: var(--moss);
+    text-decoration: underline;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .dz-pill {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--muted);
+    background: #23281f;
+    border: 1px solid var(--line);
+    padding: 5px 12px;
+    border-radius: 20px;
+  }
+
+  /* Preview Container */
+  .preview-container {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 380px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background: #000;
+  }
+  .preview-toolbar {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+  }
+  .icon-btn {
+    background: rgba(28, 31, 27, 0.85);
+    border: 1px solid var(--line);
+    color: var(--paper);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    padding: 6px 12px;
+    border-radius: 3px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0;
+  }
+  .icon-btn:hover {
+    background: var(--amber);
+    color: #14170f;
+    border-color: var(--amber);
+  }
+
+  /* Right Panel / Log */
+  .log { padding: 20px 24px; font-family: 'JetBrains Mono', monospace; }
+  .log h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin: 0 0 12px 0;
+    font-weight: 400;
+  }
+  .signal-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12.5px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .signal-row .name { color: var(--muted); }
+  .signal-row .val { color: var(--paper); font-weight: 500; }
+  .bar-row { margin: 14px 0 6px 0; }
+  .bar-row .name-row { display: flex; justify-content: space-between; font-size: 11.5px; margin-bottom: 4px; }
+  .bar-track { height: 5px; background: #14170f; border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--moss); transition: width 0.25s ease; }
+
+  .alert-strip {
+    padding: 12px 28px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--line);
+  }
+  .alert-strip.warning { background: #3a2f1a; color: var(--amber); }
+  .alert-strip.critical { background: #3a1a1a; color: #e8703d; }
+  .alert-strip.info { background: #1e2a24; color: var(--moss-light, #7fa373); }
+  .alert-disclaimer { font-size: 10px; color: var(--muted); margin-top: 4px; font-style: italic; }
+  .alert-strip .tag { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 8px; position: static; padding: 2px 6px; }
+
+  .footer-note {
+    padding: 14px 28px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+    color: var(--muted); border-top: 1px solid var(--line);
+  }
+  button.action-btn {
+    width: 100%;
+    background: var(--moss); color: #14170f; border: none; padding: 11px 16px; border-radius: 3px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11.5px; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.06em; margin-top: 14px; font-weight: 700;
+    transition: all 0.15s ease;
+  }
+  button.action-btn:hover:not(:disabled) { background: var(--amber); }
+  button.action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Upload breakdown cards */
+  .breakdown-box {
+    margin-top: 16px;
+    padding: 12px;
+    background: #191d17;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    font-size: 11.5px;
+  }
+  .breakdown-box h3 {
+    margin: 0 0 8px 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+  }
+  .badge-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .badge-item {
+    background: #23281f;
+    border: 1px solid var(--line);
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-size: 10.5px;
+  }
+  .badge-item span { color: var(--moss); font-weight: 700; }
+</style>
+</head>
+<body>
+  <div class="sheet">
+    <div class="masthead">
+      <h1>field<span>log</span> — pet gesture reader</h1>
+      <div class="meta" id="feedMeta">cam 01 · mic 01 · live</div>
+    </div>
+
+    <!-- Mode Switcher Tabs -->
+    <div class="tabs-bar">
+      <button class="tab-btn active" id="tabLive">
+        <span>📹</span> Live Camera & Mic
+      </button>
+      <button class="tab-btn" id="tabUpload">
+        <span>📁</span> Upload Media (Image / Video)
+      </button>
+    </div>
+
+    <div id="permissionNotice" style="display:none; background:#3d201c; color:#ffb4ab; border:1px solid #ff5449; border-radius:4px; padding:12px 16px; margin: 12px 28px; font-size:14px; line-height:1.5;"></div>
+    <div id="alertsContainer"></div>
+
+    <div class="gesture-banner">
+      <div>
+        <div class="eyebrow">Fused gesture</div>
+        <div class="value" id="gestureValue">—</div>
+      </div>
+      <div class="mode-pill" id="currentModeBadge">Live Mode</div>
+    </div>
+
+    <div class="body">
+      <!-- Media View Column -->
+      <div class="cam-wrap" id="mediaWrap">
+        <!-- 1. Live Feed Container -->
+        <div id="liveFeedContainer" style="width:100%; height:100%;">
+          <video id="video" autoplay playsinline muted></video>
+        </div>
+
+        <!-- 2. Upload Dropzone Container -->
+        <div id="uploadDropzone" class="dropzone-container" style="display:none;">
+          <input type="file" id="mediaFileInput" accept="image/*,video/*" style="display:none;" />
+          <div class="dz-icon">🐕</div>
+          <div class="dz-title">Drop pet photo or video here</div>
+          <div class="dz-sub">or <span class="browse-link" id="browseLink">click to browse</span></div>
+          <div class="dz-pill">Images: JPG, PNG, WEBP · Videos: MP4, MOV, WEBM</div>
+        </div>
+
+        <!-- 3. Upload Media Preview Container -->
+        <div id="uploadPreviewContainer" class="preview-container" style="display:none;">
+          <div class="preview-toolbar">
+            <button class="icon-btn" id="btnChangeMedia">↺ Change File</button>
+          </div>
+          <img id="imagePreview" class="feed-media" alt="Uploaded Pet Photo" style="display:none;" />
+          <video id="videoPreview" class="feed-media" controls playsinline style="display:none;"></video>
+        </div>
+
+        <!-- Tag Overlay -->
+        <div class="tag" id="tagOverlay">
+          <div class="label" id="topLabel">—</div>
+          <div class="conf" id="topConf">waiting for feed…</div>
+        </div>
+      </div>
+
+      <!-- Signals & Controls Column -->
+      <div class="log">
+        <h2>Signals</h2>
+        <div class="signal-row"><span class="name">Motion</span><span class="val" id="motionVal">—</span></div>
+        <div class="signal-row"><span class="name">Posture</span><span class="val" id="postureVal">—</span></div>
+        <div class="signal-row"><span class="name">Vocalization</span><span class="val" id="vocalVal">—</span></div>
+
+        <div id="bars"></div>
+
+        <!-- Live Dog Gate Toggle -->
+        <div style="margin-top: 14px; margin-bottom: 8px; padding: 8px 10px; background: #1a1e19; border: 1px solid var(--line); border-radius: 4px;">
+          <label style="font-size: 11.5px; color: var(--paper); display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="gateToggle" checked style="accent-color: var(--moss); cursor: pointer;" />
+            Require live dog (YOLO filter)
+          </label>
+          <div style="font-size: 10px; color: var(--muted); margin-top: 4px;">Uncheck if testing at desk, using toys or photos</div>
+        </div>
+
+        <!-- Mode-Specific Action Buttons -->
+        <div id="liveControls">
+          <button id="toggle" class="action-btn">Start reading</button>
+        </div>
+
+        <div id="uploadControls" style="display:none;">
+          <div id="uploadFileInfo" style="font-size: 11px; color: var(--muted); margin-bottom: 8px; word-break: break-all;"></div>
+          <button id="btnAnalyze" class="action-btn" disabled>Analyze Media</button>
+        </div>
+
+        <!-- Video Results Breakdown Container -->
+        <div id="videoBreakdown" class="breakdown-box" style="display:none;">
+          <h3>Video Temporal Summary</h3>
+          <div class="signal-row"><span class="name">Duration</span><span class="val" id="vidDuration">—</span></div>
+          <div class="signal-row"><span class="name">Sampled Frames</span><span class="val" id="vidFrames">—</span></div>
+          <div style="margin-top: 8px;">
+            <div style="font-size: 10.5px; color: var(--muted); margin-bottom: 4px;">Observed Gestures:</div>
+            <div class="badge-list" id="vidGestureBadges"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-note">frame every ~900ms · audio chunk every ~2.5s · image/video upload ready</div>
+  </div>
+
+<canvas id="hidden" width="224" height="224" style="display:none;"></canvas>
+
+<script>
+// Elements
+const video = document.getElementById('video');
+const hidden = document.getElementById('hidden');
+const ctx = hidden.getContext('2d');
+const topLabel = document.getElementById('topLabel');
+const topConf = document.getElementById('topConf');
+const motionVal = document.getElementById('motionVal');
+const postureVal = document.getElementById('postureVal');
+const vocalVal = document.getElementById('vocalVal');
+const gestureValue = document.getElementById('gestureValue');
+const alertsContainer = document.getElementById('alertsContainer');
+const barsEl = document.getElementById('bars');
+const toggleBtn = document.getElementById('toggle');
+const feedMeta = document.getElementById('feedMeta');
+const currentModeBadge = document.getElementById('currentModeBadge');
+const gateToggle = document.getElementById('gateToggle');
+
+// Tabs & Views
+const tabLive = document.getElementById('tabLive');
+const tabUpload = document.getElementById('tabUpload');
+const liveFeedContainer = document.getElementById('liveFeedContainer');
+const uploadDropzone = document.getElementById('uploadDropzone');
+const uploadPreviewContainer = document.getElementById('uploadPreviewContainer');
+const liveControls = document.getElementById('liveControls');
+const uploadControls = document.getElementById('uploadControls');
+const mediaFileInput = document.getElementById('mediaFileInput');
+const browseLink = document.getElementById('browseLink');
+const imagePreview = document.getElementById('imagePreview');
+const videoPreview = document.getElementById('videoPreview');
+const btnChangeMedia = document.getElementById('btnChangeMedia');
+const btnAnalyze = document.getElementById('btnAnalyze');
+const uploadFileInfo = document.getElementById('uploadFileInfo');
+const videoBreakdown = document.getElementById('videoBreakdown');
+const vidDuration = document.getElementById('vidDuration');
+const vidFrames = document.getElementById('vidFrames');
+const vidGestureBadges = document.getElementById('vidGestureBadges');
+
+let currentMode = 'live'; // 'live' | 'upload'
+let selectedFile = null;
+
+const SEVERITY_STYLE = { watch: "warning", info: "info", critical: "critical" };
+const SEVERITY_TAG = { watch: "⚠ Worth watching", info: "ⓘ Notice", critical: "⚠ Alert" };
+
+function renderAlerts(alerts) {
+  alertsContainer.innerHTML = '';
+  if (!alerts || alerts.length === 0) return;
+  alerts.forEach(a => {
+    const div = document.createElement('div');
+    div.className = `alert-strip ${SEVERITY_STYLE[a.severity] || 'info'}`;
+    div.innerHTML = `<span class="tag">${SEVERITY_TAG[a.severity] || 'ⓘ Notice'}</span>${a.message}`;
+    alertsContainer.appendChild(div);
+  });
+  const note = document.createElement('div');
+  note.className = 'alert-disclaimer';
+  note.textContent = 'Heuristic pattern flags from camera angle + pose geometry only — not a veterinary diagnosis. See a vet for anything persistent or concerning.';
+  alertsContainer.appendChild(note);
+}
+
+function renderBars(all) {
+  barsEl.innerHTML = '';
+  if (!all) return;
+  all.forEach(item => {
+    const pct = Math.round(item.confidence * 100);
+    const row = document.createElement('div');
+    row.className = 'bar-row';
+    row.innerHTML = `
+      <div class="name-row"><span>${item.label}</span><span>${pct}%</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+    `;
+    barsEl.appendChild(row);
+  });
+}
+
+function showNotice(html, isError = true) {
+  const el = document.getElementById('permissionNotice');
+  if (el) {
+    el.innerHTML = html;
+    el.style.background = isError ? '#3d201c' : '#1e3323';
+    el.style.color = isError ? '#ffb4ab' : '#b6f2be';
+    el.style.borderColor = isError ? '#ff5449' : '#7fa373';
+    el.style.display = 'block';
+  }
+}
+
+function clearNotice() {
+  const el = document.getElementById('permissionNotice');
+  if (el) {
+    el.innerHTML = '';
+    el.style.display = 'none';
+  }
+}
+
+// -------------------------------------------------------------
+// TAB SWITCHING
+// -------------------------------------------------------------
+tabLive.addEventListener('click', () => {
+  if (currentMode === 'live') return;
+  currentMode = 'live';
+  tabLive.classList.add('active');
+  tabUpload.classList.remove('active');
+
+  liveFeedContainer.style.display = 'block';
+  uploadDropzone.style.display = 'none';
+  uploadPreviewContainer.style.display = 'none';
+  liveControls.style.display = 'block';
+  uploadControls.style.display = 'none';
+  videoBreakdown.style.display = 'none';
+
+  feedMeta.textContent = 'cam 01 · mic 01 · live';
+  currentModeBadge.textContent = 'Live Mode';
+  topLabel.textContent = '—';
+  topConf.textContent = 'waiting for feed…';
+  gestureValue.textContent = '—';
+  clearNotice();
+});
+
+tabUpload.addEventListener('click', () => {
+  if (currentMode === 'upload') return;
+  // Stop live streaming if running
+  if (streaming) {
+    stopLiveReading();
+  }
+  currentMode = 'upload';
+  tabUpload.classList.add('active');
+  tabLive.classList.remove('active');
+
+  liveFeedContainer.style.display = 'none';
+  liveControls.style.display = 'none';
+  uploadControls.style.display = 'block';
+
+  feedMeta.textContent = 'media upload · offline file';
+  currentModeBadge.textContent = 'Upload Mode';
+
+  if (!selectedFile) {
+    uploadDropzone.style.display = 'flex';
+    uploadPreviewContainer.style.display = 'none';
+    topLabel.textContent = 'Upload File';
+    topConf.textContent = 'select image or video';
+    gestureValue.textContent = '—';
+  } else {
+    uploadDropzone.style.display = 'none';
+    uploadPreviewContainer.style.display = 'flex';
+  }
+  clearNotice();
+});
+
+// -------------------------------------------------------------
+// FILE SELECTION & DRAG-AND-DROP
+// -------------------------------------------------------------
+browseLink.addEventListener('click', (e) => {
+  e.stopPropagation();
+  mediaFileInput.click();
+});
+uploadDropzone.addEventListener('click', () => mediaFileInput.click());
+
+['dragenter', 'dragover'].forEach(name => {
+  uploadDropzone.addEventListener(name, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    uploadDropzone.classList.add('drag-active');
+  });
+});
+
+['dragleave', 'drop'].forEach(name => {
+  uploadDropzone.addEventListener(name, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    uploadDropzone.classList.remove('drag-active');
+  });
+});
+
+uploadDropzone.addEventListener('drop', (e) => {
+  const files = e.dataTransfer.files;
+  if (files && files.length > 0) {
+    handleFileSelected(files[0]);
+  }
+});
+
+mediaFileInput.addEventListener('change', (e) => {
+  if (e.target.files && e.target.files.length > 0) {
+    handleFileSelected(e.target.files[0]);
+  }
+});
+
+btnChangeMedia.addEventListener('click', () => {
+  selectedFile = null;
+  mediaFileInput.value = '';
+  imagePreview.style.display = 'none';
+  videoPreview.style.display = 'none';
+  if (videoPreview.src) {
+    videoPreview.pause();
+    videoPreview.removeAttribute('src');
+  }
+  uploadDropzone.style.display = 'flex';
+  uploadPreviewContainer.style.display = 'none';
+  btnAnalyze.disabled = true;
+  uploadFileInfo.textContent = '';
+  videoBreakdown.style.display = 'none';
+  topLabel.textContent = 'Upload File';
+  topConf.textContent = 'select image or video';
+  gestureValue.textContent = '—';
+  motionVal.textContent = '—';
+  postureVal.textContent = '—';
+  vocalVal.textContent = '—';
+  barsEl.innerHTML = '';
+  renderAlerts([]);
+});
+
+function handleFileSelected(file) {
+  selectedFile = file;
+  const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|avi|webm|mkv)$/i.test(file.name);
+  const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
+  uploadFileInfo.textContent = `Selected: ${file.name} (${sizeMb} MB) — ${isVideo ? 'Video' : 'Image'}`;
+
+  uploadDropzone.style.display = 'none';
+  uploadPreviewContainer.style.display = 'flex';
+  btnAnalyze.disabled = false;
+  btnAnalyze.textContent = isVideo ? 'Analyze Video' : 'Analyze Image';
+  videoBreakdown.style.display = 'none';
+
+  const objUrl = URL.createObjectURL(file);
+  if (isVideo) {
+    imagePreview.style.display = 'none';
+    videoPreview.style.display = 'block';
+    videoPreview.src = objUrl;
+  } else {
+    videoPreview.style.display = 'none';
+    if (videoPreview.src) videoPreview.pause();
+    imagePreview.style.display = 'block';
+    imagePreview.src = objUrl;
+  }
+
+  topLabel.textContent = 'Ready to Analyze';
+  topConf.textContent = 'click Analyze Media button';
+  gestureValue.textContent = '—';
+
+  // Automatically trigger analysis for images for smooth instant feedback!
+  if (!isVideo) {
+    analyzeUploadedMedia();
+  }
+}
+
+// -------------------------------------------------------------
+// ANALYZE UPLOADED MEDIA
+// -------------------------------------------------------------
+btnAnalyze.addEventListener('click', analyzeUploadedMedia);
+
+async function analyzeUploadedMedia() {
+  if (!selectedFile) return;
+  clearNotice();
+
+  btnAnalyze.disabled = true;
+  btnAnalyze.textContent = 'Analyzing... please wait';
+  topLabel.textContent = 'Analyzing...';
+  topConf.textContent = 'processing deep models';
+  gestureValue.textContent = 'Processing…';
+
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+  const skipGate = !gateToggle.checked;
+  formData.append('skip_dog_gate', skipGate ? 'true' : 'false');
+
+  try {
+    const res = await fetch('/upload', {
+      method: 'POST',
+      body: formData
+    });
+    const json = await res.json();
+
+    if (json.error) {
+      showNotice(`<strong>Upload Error:</strong> ${json.error}`);
+      topLabel.textContent = 'Error';
+      topConf.textContent = 'analysis failed';
+      gestureValue.textContent = '—';
+      btnAnalyze.disabled = false;
+      btnAnalyze.textContent = 'Retry Analysis';
+      return;
+    }
+
+    // Check dog gate
+    if (!json.dog_present) {
+      topLabel.textContent = "No dog detected";
+      topConf.textContent = json.message || "No dog found in uploaded media";
+      gestureValue.textContent = json.gesture || "No dog detected";
+      motionVal.textContent = "—";
+      postureVal.textContent = "—";
+      vocalVal.textContent = "—";
+      barsEl.innerHTML = '';
+      btnAnalyze.disabled = false;
+      btnAnalyze.textContent = 'Analyze Again';
+      return;
+    }
+
+    if (json.type === 'image') {
+      // Single Image results
+      topLabel.textContent = json.emotion ? json.emotion.label : 'Detected';
+      topConf.textContent = json.emotion ? `${Math.round(json.emotion.confidence * 100)}% confidence` : '';
+      motionVal.textContent = `${json.motion.label}`;
+      postureVal.textContent = json.posture ? json.posture.label : '—';
+      vocalVal.textContent = json.vocalization ? json.vocalization.label : 'N/A';
+      gestureValue.textContent = json.gesture;
+
+      if (json.annotated_image) {
+        imagePreview.src = json.annotated_image;
+      }
+      if (json.emotion && json.emotion.all) {
+        renderBars(json.emotion.all);
+      }
+      renderAlerts(json.alerts || []);
+      videoBreakdown.style.display = 'none';
+
+    } else if (json.type === 'video') {
+      // Video results
+      const fusion = json.final_fusion || {};
+      topLabel.textContent = fusion.emotion || '—';
+      topConf.textContent = 'Dominant Video Emotion';
+      motionVal.textContent = `${fusion.motion || '—'}`;
+      postureVal.textContent = `${fusion.posture || '—'}`;
+      vocalVal.textContent = 'N/A (Video)';
+      gestureValue.textContent = fusion.gesture || '—';
+
+      // Render Video Breakdown
+      if (json.video) {
+        vidDuration.textContent = `${json.video.duration_seconds}s (${json.video.total_frames} frames @ ${json.video.fps} FPS)`;
+        vidFrames.textContent = `${json.video.processed_frames} sampled frames`;
+      }
+
+      vidGestureBadges.innerHTML = '';
+      if (json.gesture_counts) {
+        const total = Object.values(json.gesture_counts).reduce((a,b) => a+b, 0);
+        for (const [name, count] of Object.entries(json.gesture_counts)) {
+          const pct = Math.round((count / Math.max(1, total)) * 100);
+          const badge = document.createElement('div');
+          badge.className = 'badge-item';
+          badge.innerHTML = `${name}: <span>${pct}%</span>`;
+          vidGestureBadges.appendChild(badge);
+        }
+      }
+      videoBreakdown.style.display = 'block';
+
+      // Render emotion distribution bars
+      if (json.emotion_counts) {
+        const totalEmotions = Object.values(json.emotion_counts).reduce((a,b) => a+b, 0);
+        const emotionList = Object.entries(json.emotion_counts).map(([label, count]) => ({
+          label,
+          confidence: count / Math.max(1, totalEmotions)
+        })).sort((a,b) => b.confidence - a.confidence);
+        renderBars(emotionList);
+      }
+      renderAlerts([]);
+    }
+
+    btnAnalyze.disabled = false;
+    btnAnalyze.textContent = 'Analyze Again';
+
+  } catch (err) {
+    console.error('Analysis error:', err);
+    showNotice(`<strong>Processing Error:</strong> ${err.message || err}`);
+    btnAnalyze.disabled = false;
+    btnAnalyze.textContent = 'Retry Analysis';
+  }
+}
+
+// -------------------------------------------------------------
+// LIVE WEBCAM & AUDIO
+// -------------------------------------------------------------
+let streaming = false;
+let frameTimer = null;
+let audioCtx = null;
+let processorNode = null;
+let audioChunks = [];
+let audioTimer = null;
+
+async function startCam() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+  video.srcObject = stream;
+}
+
+async function captureAndSendFrame() {
+  if (currentMode !== 'live' || !streaming) return;
+  const w = video.videoWidth || 640;
+  const h = video.videoHeight || 480;
+  hidden.width = w;
+  hidden.height = h;
+  ctx.drawImage(video, 0, 0, w, h);
+  const dataUrl = hidden.toDataURL('image/jpeg', 0.85);
+  const skipGate = !gateToggle.checked;
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataUrl, skip_dog_gate: skipGate })
+    });
+    const json = await res.json();
+    if (json.error) { console.error(json.error); return; }
+    if (!json.dog_present) {
+      topLabel.textContent = "No dog detected";
+      topConf.textContent = json.message || "Point camera at a dog";
+      gestureValue.textContent = json.gesture || "No dog detected";
+      barsEl.innerHTML = '';
+      return;
+    }
+    topLabel.textContent = json.emotion.label;
+    topConf.textContent = Math.round(json.emotion.confidence * 100) + '% confidence';
+    motionVal.textContent = `${json.motion.label} (${json.motion.score})`;
+    postureVal.textContent = json.posture ? json.posture.label : '—';
+    vocalVal.textContent = `${json.vocalization.label}`;
+    gestureValue.textContent = json.gesture;
+    renderAlerts(json.alerts);
+    renderBars(json.emotion.all);
+  } catch (e) { console.error(e); }
+}
+
+function floatTo16BitPCM(float32Array) {
+  const buf = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    buf[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return buf;
+}
+
+function downsampleTo16k(buffer, inputRate) {
+  if (inputRate === 16000) return buffer;
+  const ratio = inputRate / 16000;
+  const outLength = Math.floor(buffer.length / ratio);
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(buffer.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    const count = Math.max(1, end - start);
+    for (let j = start; j < end; j++) {
+      sum += buffer[j];
+    }
+    out[i] = sum / count;
+  }
+  return out;
+}
+
+async function startAudio() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+  const source = audioCtx.createMediaStreamSource(stream);
+  processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  audioChunks = [];
+
+  processorNode.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    audioChunks.push(downsampleTo16k(input, audioCtx.sampleRate));
+  };
+  source.connect(processorNode);
+  audioTimer = setInterval(sendAudioChunk, 2500);
+}
+
+async function sendAudioChunk() {
+  if (audioChunks.length === 0) return;
+  const total = audioChunks.reduce((a, c) => a + c.length, 0);
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const c of audioChunks) { merged.set(c, offset); offset += c.length; }
+  audioChunks = [];
+
+  const pcm16 = floatTo16BitPCM(merged);
+  const bytes = new Uint8Array(pcm16.buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  const b64 = btoa(binary);
+
+  try {
+    const res = await fetch('/predict_audio', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pcm16: b64 })
+    });
+    const json = await res.json();
+    if (!json.error) vocalVal.textContent = json.label;
+  } catch (e) { console.error(e); }
+}
+
+function stopLiveReading() {
+  streaming = false;
+  toggleBtn.textContent = 'Start reading';
+  clearInterval(frameTimer);
+  clearInterval(audioTimer);
+  if (processorNode) processorNode.disconnect();
+  if (audioCtx) audioCtx.close();
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(track => track.stop());
+    video.srcObject = null;
+  }
+  topLabel.textContent = '—';
+  topConf.textContent = 'paused';
+  gestureValue.textContent = '—';
+  renderAlerts([]);
+  clearNotice();
+}
+
+toggleBtn.addEventListener('click', async () => {
+  if (!streaming) {
+    clearNotice();
+    toggleBtn.disabled = true;
+    toggleBtn.textContent = 'Requesting access…';
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showNotice(
+        `<strong>⚠️ Media Devices Unavailable:</strong> Your browser has blocked camera/mic access for this page.<br>` +
+        `Make sure you are browsing on <strong>http://localhost:5000</strong> using Chrome, Edge, or Firefox.`
+      );
+      toggleBtn.disabled = false;
+      toggleBtn.textContent = 'Start reading';
+      return;
+    }
+
+    let camStarted = false;
+    let micStarted = false;
+
+    try {
+      await startCam();
+      camStarted = true;
+    } catch (camErr) {
+      console.error('Camera access error:', camErr);
+      let msg = 'Please allow camera permissions in your browser. (Click the camera or lock icon left of URL bar, choose Allow, and refresh).';
+      if (camErr.name === 'NotReadableError' || camErr.name === 'TrackStartError') {
+        msg = 'Your webcam is currently in use by another application. Please close it and retry.';
+      } else if (camErr.name === 'NotFoundError' || camErr.name === 'DevicesNotFoundError') {
+        msg = 'No webcam was detected on your system. Plug in or enable a camera.';
+      }
+      showNotice(`<strong>Camera Error (${camErr.name}):</strong><br>${msg}`);
+    }
+
+    try {
+      await startAudio();
+      micStarted = true;
+    } catch (micErr) {
+      console.warn('Microphone access error:', micErr);
+      vocalVal.textContent = 'Mic disabled / denied';
+      if (camStarted) {
+        showNotice(
+          `<strong>Notice:</strong> Microphone access was not granted (${micErr.name}). Video emotion and motion tracking will run normally without live audio.`,
+          false
+        );
+      }
+    }
+
+    toggleBtn.disabled = false;
+
+    if (camStarted) {
+      streaming = true;
+      toggleBtn.textContent = 'Stop reading';
+      frameTimer = setInterval(captureAndSendFrame, 900);
+    } else {
+      toggleBtn.textContent = 'Start reading';
+    }
+  } else {
+    stopLiveReading();
+  }
+});
+</script>
+</body>
+</html>
