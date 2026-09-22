@@ -2,7 +2,7 @@
 app.py — FastAPI backend for the live-webcam+mic pet gesture prototype.
 
 Signals combined into one gesture readout:
-  - dog presence:  general COCO-pretrained gate, runs BEFORE anything else (dog_detector.py)
+  - dog presence:  strict COCO-pretrained gate, runs BEFORE emotion/pose inference (dog_detector.py)
   - emotion:       per-frame CNN classification, gated on confidence + margin (model.py)
   - motion:        pose-based paw velocity if trained (pose_motion.py),
                     else frame-differencing fallback (motion.py)
@@ -54,13 +54,16 @@ from PIL import Image
 from model import load_inference_model, preprocess_frame, passes_confidence_gate, CLASSES
 from motion import to_gray_small, classify_motion
 from pose_motion import (load_pose_model, extract_keypoints, classify_motion_from_pose,
-                          classify_posture, compute_tail_low)
+                          classify_posture, compute_tail_low, PoseStateTracker)
 from wellness_alerts import WellnessTracker
 from audio import classify_vocalization, decode_pcm16_base64
 from fusion import fuse
+from dog_detector import load_dog_detector, detect_dog, crop_dog
 
-# YOLO dog filter removed per user request: all frames and uploads are processed directly
-_dog_detector_available = False
+# IMPORTANT: the dog gate runs BEFORE the dog-emotion model.
+# If the detector cannot load, we fail closed instead of treating humans as dogs.
+_dog_detector = load_dog_detector()
+_dog_detector_available = _dog_detector is not None
 
 app = FastAPI()
 
@@ -118,6 +121,7 @@ def get_session_state(request: Request) -> dict:
         SESSIONS[sid] = {
             "prev_gray": None,
             "prev_kpts": None,
+            "pose_tracker": PoseStateTracker(),
             "last_vocalization": {"label": "Quiet", "confidence": 0.0, "raw_top_class": "",
                                    "available": True, "ts": 0.0},
             "wellness": WellnessTracker(window=20),
@@ -166,12 +170,87 @@ def index(request: Request):
     )
 
 
+
+def pose_features_to_cues(pose_features: dict) -> dict:
+    """Convert PoseStateTracker output into the format expected by fusion.py."""
+    posture = pose_features.get("posture", {})
+    tail = pose_features.get("tail", {})
+    ears = pose_features.get("ears", {})
+    head = pose_features.get("head", {})
+    paw = pose_features.get("paw", {})
+
+    return {
+        "posture": posture.get("label", "Unknown"),
+        "posture_confidence": float(posture.get("confidence", 0.0)),
+        "tail": tail,
+        "ears": ears,
+        "head": head,
+        "paw": paw,
+        "tail_low": bool(tail.get("low", False)),
+        "tail_raised": bool(tail.get("raised", False)),
+        "tail_moving": bool(tail.get("moving", False)),
+        "tail_wagging": {
+            "active": bool(tail.get("wagging", False)),
+            "confidence": float(tail.get("wag_score", 0.0)),
+        },
+        "paw_raised": paw.get("label") not in {None, "None", ""},
+    }
+
+def dog_gate_response(presence: dict, media_type: str = "image") -> dict:
+    """Standard response when no sufficiently confident dog is detected."""
+    if not presence.get("available", False):
+        message = (
+            "Dog detector is unavailable. Install/download yolo11n.pt or set "
+            "DOG_DETECTOR_WEIGHTS to a valid YOLO detector file."
+        )
+    else:
+        message = "No dog detected with sufficient confidence."
+
+    return {
+        "success": True,
+        "type": media_type,
+        "dog_present": False,
+        "dog_gate_active": bool(presence.get("available", False)),
+        "dog_confidence": float(presence.get("confidence", 0.0)),
+        "message": message,
+        "is_trained": is_trained,
+        "pose_active": pose_model is not None,
+        "emotion": None,
+        "motion": {"label": "Unknown", "score": 0.0},
+        "posture": {"label": "Unknown", "confidence": 0.0},
+        "vocalization": {"label": "N/A", "confidence": None, "available": False},
+        "gesture": "No dog detected",
+        "gesture_raw": "No dog detected",
+        "fusion_score": 0.0,
+        "alerts": [],
+    }
+
+
+def get_dog_crop(frame_bgr: np.ndarray):
+    """
+    Detect the dog on the full frame, then crop the detected dog before
+    emotion/pose inference. This prevents the dog-emotion classifier from
+    seeing a human/background and being forced to choose a dog emotion.
+    """
+    presence = detect_dog(frame_bgr)
+    if not presence["present"]:
+        return None, presence
+
+    dog_crop, origin = crop_dog(frame_bgr, presence)
+    if dog_crop is None or dog_crop.size == 0:
+        presence["present"] = False
+        presence["bbox"] = None
+        return None, presence
+
+    presence["crop_origin"] = origin
+    return dog_crop, presence
+
 @app.post("/predict")
 def predict(payload: PredictRequest, request: Request):
     state = get_session_state(request)
 
     data_url = payload.image
-    skip_dog_gate = payload.skip_dog_gate
+    skip_dog_gate = False
     if "," in data_url:
         data_url = data_url.split(",", 1)[1]
 
@@ -184,10 +263,19 @@ def predict(payload: PredictRequest, request: Request):
     frame_rgb = np.array(pil_img)
     frame_bgr = frame_rgb[:, :, ::-1]
 
-    presence = {"present": True, "confidence": 1.0}
+    # --- HARD DOG GATE: humans never reach the dog-emotion classifier ---
+    if not skip_dog_gate:
+        dog_frame, presence = get_dog_crop(frame_bgr)
+        if dog_frame is None:
+            return dog_gate_response(presence, "image")
+        frame_for_model = dog_frame
+    else:
+        # Only useful for controlled debugging; UI/API should normally leave this false.
+        presence = {"present": True, "confidence": 1.0, "available": False}
+        frame_for_model = frame_bgr
 
     # --- emotion, with confidence + margin gating ---
-    batch = preprocess_frame(frame_bgr)
+    batch = preprocess_frame(frame_for_model)
     probs = model.predict(batch, verbose=0)[0]
     ranked = sorted(zip(CLASSES, probs.tolist()), key=lambda p: p[1], reverse=True)
     raw_emotion_label, emotion_conf = ranked[0]
@@ -195,18 +283,21 @@ def predict(payload: PredictRequest, request: Request):
     sorted_probs = [p for _, p in ranked]
     emotion_is_confident = passes_confidence_gate(sorted_probs)
 
-    # --- motion + posture: pose-based if a trained pose model exists, else pixel-diff fallback ---
+    # --- motion + posture + temporal pose behavior cues ---
     posture_result = {"label": "Unknown", "confidence": 0.0}
     curr_kpts, bbox_diag = None, None
+    pose_features = state["pose_tracker"].update(None, None)
+
     if pose_model is not None:
-        pose_res = extract_keypoints(pose_model, frame_bgr)
+        pose_res = extract_keypoints(pose_model, frame_for_model)
         curr_kpts, bbox_diag = pose_res[0], pose_res[1]
-        motion_result = classify_motion_from_pose(state["prev_kpts"], curr_kpts, bbox_diag)
-        if curr_kpts is not None:
-            posture_result = classify_posture(curr_kpts, bbox_diag)
+        pose_features = state["pose_tracker"].update(curr_kpts, bbox_diag)
+        motion_result = pose_features["motion"]
+        posture_result = pose_features["posture"]
         state["prev_kpts"] = curr_kpts
     else:
-        curr_gray_small = to_gray_small(frame_bgr)
+        state["pose_tracker"].reset()
+        curr_gray_small = to_gray_small(frame_for_model)
         motion_result = classify_motion(state["prev_gray"], curr_gray_small)
         state["prev_gray"] = curr_gray_small
 
@@ -221,10 +312,10 @@ def predict(payload: PredictRequest, request: Request):
         vocalization_label = "Quiet"
         vocal_conf = None  # unknown, not "confidently quiet" -- don't let it drag scores down
 
-    # --- fuse: real confidences + pose cues, not placeholders ---
+    # --- fuse all available pose cues ---
     fused_emotion_label = canonical_emotion if emotion_is_confident else "Uncertain"
-    pose_cues = {"posture": posture_result["label"],
-                 "tail_low": compute_tail_low(curr_kpts, bbox_diag) if curr_kpts is not None else False}
+    pose_cues = pose_features_to_cues(pose_features)
+
     fused = fuse(fused_emotion_label, emotion_conf, motion_result["label"],
                  vocalization_label, vocal_conf, pose_cues)
 
@@ -240,7 +331,7 @@ def predict(payload: PredictRequest, request: Request):
 
     return {
         "dog_present": True,
-        "dog_gate_active": _dog_detector_available,
+        "dog_gate_active": bool(_dog_detector_available and not skip_dog_gate),
         "dog_confidence": presence["confidence"],
         "is_trained": is_trained,
         "pose_active": pose_model is not None,
@@ -253,6 +344,10 @@ def predict(payload: PredictRequest, request: Request):
         },
         "motion": motion_result,
         "posture": posture_result,
+        "tail": pose_features.get("tail", {}),
+        "ears": pose_features.get("ears", {}),
+        "head": pose_features.get("head", {}),
+        "paw": pose_features.get("paw", {}),
         "vocalization": {**last_vocal, "fresh": vocal_age <= VOCAL_FRESHNESS_SECONDS},
         "gesture": smoothed_gesture,
         "gesture_raw": fused["gesture"],
@@ -316,37 +411,48 @@ def annotate_pose(bgr_image: np.ndarray, kpts: np.ndarray) -> str:
 
 
 def process_single_image(frame_bgr: np.ndarray) -> dict:
-    """Core pipeline for single-image analysis without any blocking YOLO dog filters."""
-    # --- emotion classification ---
-    batch = preprocess_frame(frame_bgr)
-    probs = model.predict(batch, verbose=0)[0]
-    ranked = sorted(zip(CLASSES, probs.tolist()), key=lambda p: p[1], reverse=True)
-    raw_emotion_label, emotion_conf = ranked[0]
-    canonical_emotion = FOLDER_TO_EMOTION.get(raw_emotion_label.lower(), raw_emotion_label)
-    sorted_probs = [p for _, p in ranked]
-    emotion_is_confident = passes_confidence_gate(sorted_probs)
+    """Analyze an image only after a confident dog detection."""
+    dog_frame, presence = get_dog_crop(frame_bgr)
 
-    # --- pose / posture ---
+    if dog_frame is None:
+        return dog_gate_response(presence, "image")
+
+    # --- emotion classification on DOG CROP only ---
+    batch = preprocess_frame(dog_frame)
+    probs = model.predict(batch, verbose=0)[0]
+    ranked = sorted(
+        zip(CLASSES, probs.tolist()),
+        key=lambda p: p[1],
+        reverse=True,
+    )
+    raw_emotion_label, emotion_conf = ranked[0]
+    canonical_emotion = FOLDER_TO_EMOTION.get(
+        raw_emotion_label.lower(), raw_emotion_label
+    )
+    emotion_is_confident = passes_confidence_gate([p for _, p in ranked])
+
+    # --- pose / posture / behavior cues on DOG CROP ONLY ---
     posture_result = {"label": "Unknown", "confidence": 0.0}
     curr_kpts, bbox_diag = None, None
-    if pose_model is not None:
-        pose_res = extract_keypoints(pose_model, frame_bgr)
-        curr_kpts, bbox_diag = pose_res[0], pose_res[1]
-        if curr_kpts is not None:
-            posture_result = classify_posture(curr_kpts, bbox_diag)
+    image_pose_tracker = PoseStateTracker()
+    pose_features = image_pose_tracker.update(None, None)
 
-    # For single uploaded image, motion is Still (single frame)
-    motion_result = {"label": "Still", "score": 0.0}
+    if pose_model is not None:
+        pose_res = extract_keypoints(pose_model, dog_frame)
+        curr_kpts, bbox_diag = pose_res[0], pose_res[1]
+        pose_features = image_pose_tracker.update(curr_kpts, bbox_diag)
+        posture_result = pose_features["posture"]
+
+    # A single uploaded image has no temporal motion information.
+    motion_result = {"label": "Still", "score": 0.0, "confidence": 0.0}
     vocalization_label = "Quiet"
     vocal_conf = None
 
-    # Use the canonical emotion directly for fusion
-    fused_emotion_label = canonical_emotion
-    tail_low_val = bool(compute_tail_low(curr_kpts, bbox_diag)) if curr_kpts is not None else False
-    pose_cues = {
-        "posture": posture_result["label"],
-        "tail_low": tail_low_val,
-    }
+    fused_emotion_label = (
+        canonical_emotion if emotion_is_confident else "Uncertain"
+    )
+    pose_cues = pose_features_to_cues(pose_features)
+
     fused = fuse(
         fused_emotion_label,
         emotion_conf,
@@ -357,26 +463,31 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
     )
 
     gesture_name = fused["gesture"]
-    # If the rule-based fusion output the generic "Emotion · Still · Quiet", enhance to natural wording
     if " · " in gesture_name:
         posture = posture_result.get("label", "Unknown")
-        posture_suffix = f" ({posture.lower()})" if posture != "Unknown" else ""
+        posture_suffix = (
+            f" ({posture.lower()})" if posture != "Unknown" else ""
+        )
         descriptive_map = {
             "Happy": f"Content and playful{posture_suffix}",
             "Relaxed": f"Calm and resting{posture_suffix}",
             "Sad": f"Quiet and withdrawn{posture_suffix}",
             "Angry": f"Alert / watchful stance{posture_suffix}",
         }
-        gesture_name = descriptive_map.get(canonical_emotion, f"{canonical_emotion} pet state{posture_suffix}")
+        gesture_name = descriptive_map.get(
+            canonical_emotion,
+            f"{canonical_emotion} pet state{posture_suffix}",
+        )
 
-    annotated_b64 = annotate_pose(frame_bgr, curr_kpts)
+    annotated_b64 = annotate_pose(dog_frame, curr_kpts)
 
     return {
         "success": True,
         "type": "image",
         "dog_present": True,
-        "dog_gate_active": False,
-        "dog_confidence": 1.0,
+        "dog_gate_active": True,
+        "dog_confidence": float(presence["confidence"]),
+        "dog_bbox": presence.get("bbox"),
         "is_trained": is_trained,
         "pose_active": pose_model is not None,
         "emotion": {
@@ -384,11 +495,25 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
             "raw_label": raw_emotion_label,
             "confidence": float(emotion_conf),
             "confident": bool(emotion_is_confident),
-            "all": [{"label": str(FOLDER_TO_EMOTION.get(l.lower(), l)), "confidence": float(c)} for l, c in ranked],
+            "all": [
+                {
+                    "label": str(FOLDER_TO_EMOTION.get(l.lower(), l)),
+                    "confidence": float(c),
+                }
+                for l, c in ranked
+            ],
         },
         "motion": motion_result,
         "posture": posture_result,
-        "vocalization": {"label": "N/A (Image)", "confidence": None, "available": False},
+        "tail": pose_features.get("tail", {}),
+        "ears": pose_features.get("ears", {}),
+        "head": pose_features.get("head", {}),
+        "paw": pose_features.get("paw", {}),
+        "vocalization": {
+            "label": "N/A (Image)",
+            "confidence": None,
+            "available": False,
+        },
         "gesture": gesture_name,
         "gesture_raw": fused["gesture"],
         "fusion_score": float(fused["score"]),
@@ -433,7 +558,7 @@ async def handle_image_upload(target: UploadFile, skip_dog_gate: bool = False):
 
 
 async def handle_video_upload(target: UploadFile):
-    """Core handler for uploaded video files without any dog gate filters."""
+    """Analyze uploaded video, running dog detection before every model."""
     allowed_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     filename = target.filename or "uploaded_video.mp4"
     extension = Path(filename).suffix.lower()
@@ -458,7 +583,10 @@ async def handle_video_upload(target: UploadFile):
 
         cap = cv2.VideoCapture(temp_path)
         if not cap.isOpened():
-            return JSONResponse({"error": "Could not open uploaded video."}, status_code=400)
+            return JSONResponse(
+                {"error": "Could not open uploaded video."},
+                status_code=400,
+            )
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         if fps <= 0:
@@ -467,17 +595,18 @@ async def handle_video_upload(target: UploadFile):
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         duration = total_frames / fps if total_frames else 0.0
 
-        # Sample at up to 5 FPS to keep inference responsive
         sample_fps = min(5.0, fps)
         frame_interval = max(1, int(round(fps / sample_fps)))
         actual_sample_fps = fps / frame_interval
 
         prev_kpts = None
         prev_gray = None
+        pose_tracker = PoseStateTracker()
         gesture_history = deque(maxlen=GESTURE_SMOOTHING_WINDOW)
         frame_results = []
         frame_number = 0
         processed_frames = 0
+        dog_frames = 0
 
         while True:
             ok, frame_bgr = cap.read()
@@ -491,8 +620,43 @@ async def handle_video_upload(target: UploadFile):
             processed_frames += 1
             timestamp = round(frame_number / fps, 2)
 
-            # -------- emotion --------
-            batch = preprocess_frame(frame_bgr)
+            # ---------- HARD DOG GATE ----------
+            dog_frame, presence = get_dog_crop(frame_bgr)
+
+            if dog_frame is None:
+                # Reset temporal state so a human segment cannot influence
+                # the next dog segment.
+                prev_kpts = None
+                prev_gray = None
+                pose_tracker.reset()
+                gesture_history.clear()
+
+                frame_results.append({
+                    "frame": int(frame_number),
+                    "time": float(timestamp),
+                    "dog_present": False,
+                    "dog_confidence": float(presence.get("confidence", 0.0)),
+                    "emotion": None,
+                    "motion": {"label": "Unknown", "score": 0.0},
+                    "posture": {"label": "Unknown", "confidence": 0.0},
+                    "tail_low": False,
+                    "vocalization": {
+                        "label": "Not processed",
+                        "confidence": None,
+                        "available": False,
+                    },
+                    "gesture_raw": "No dog detected",
+                    "gesture": "No dog detected",
+                    "fusion_score": 0.0,
+                })
+
+                frame_number += 1
+                continue
+
+            dog_frames += 1
+
+            # ---------- emotion on DOG CROP ----------
+            batch = preprocess_frame(dog_frame)
             probs = model.predict(batch, verbose=0)[0]
             ranked = sorted(
                 zip(CLASSES, probs.tolist()),
@@ -507,41 +671,32 @@ async def handle_video_upload(target: UploadFile):
                 [p for _, p in ranked]
             )
 
-            # -------- pose / motion / posture --------
+            # ---------- pose / motion / posture / behavior cues ----------
             curr_kpts = None
             bbox_diag = None
             posture_result = {"label": "Unknown", "confidence": 0.0}
+            pose_features = pose_tracker.update(None, None)
 
             if pose_model is not None:
-                pose_res = extract_keypoints(pose_model, frame_bgr)
+                pose_res = extract_keypoints(pose_model, dog_frame)
                 curr_kpts, bbox_diag = pose_res[0], pose_res[1]
-                motion_result = classify_motion_from_pose(
-                    prev_kpts, curr_kpts, bbox_diag
-                )
-                if curr_kpts is not None:
-                    posture_result = classify_posture(curr_kpts, bbox_diag)
+                pose_features = pose_tracker.update(curr_kpts, bbox_diag)
+                motion_result = pose_features["motion"]
+                posture_result = pose_features["posture"]
                 prev_kpts = curr_kpts
             else:
-                curr_gray = to_gray_small(frame_bgr)
+                pose_tracker.reset()
+                curr_gray = to_gray_small(dog_frame)
                 motion_result = classify_motion(prev_gray, curr_gray)
                 prev_gray = curr_gray
 
-            # -------- vocalization --------
             vocalization_label = "Unknown"
             vocal_conf = None
 
-            # -------- fusion --------
-            # Use canonical_emotion directly (don't gate to "Uncertain" for video —
-            # the per-frame emotion is real, just use it even if confidence is moderate)
-            fused_emotion_label = canonical_emotion
-            pose_cues = {
-                "posture": posture_result["label"],
-                "tail_low": (
-                    bool(compute_tail_low(curr_kpts, bbox_diag))
-                    if curr_kpts is not None
-                    else False
-                ),
-            }
+            fused_emotion_label = (
+                canonical_emotion if emotion_is_confident else "Uncertain"
+            )
+            pose_cues = pose_features_to_cues(pose_features)
 
             fused = fuse(
                 fused_emotion_label,
@@ -552,27 +707,35 @@ async def handle_video_upload(target: UploadFile):
                 pose_cues,
             )
 
-            # Apply same descriptive gesture naming as single-image pipeline
             raw_gesture = fused["gesture"]
             if " · " in raw_gesture:
                 posture_lbl = posture_result.get("label", "Unknown")
-                posture_suffix = f" ({posture_lbl.lower()})" if posture_lbl != "Unknown" else ""
-                _desc_map = {
+                posture_suffix = (
+                    f" ({posture_lbl.lower()})"
+                    if posture_lbl != "Unknown" else ""
+                )
+                desc_map = {
                     "Happy": f"Content and playful{posture_suffix}",
                     "Relaxed": f"Calm and resting{posture_suffix}",
                     "Sad": f"Quiet and withdrawn{posture_suffix}",
                     "Angry": f"Alert / watchful stance{posture_suffix}",
                 }
-                raw_gesture = _desc_map.get(canonical_emotion, f"{canonical_emotion} pet state{posture_suffix}")
+                raw_gesture = desc_map.get(
+                    canonical_emotion,
+                    f"{canonical_emotion} pet state{posture_suffix}",
+                )
 
             gesture_history.append(raw_gesture)
-            smoothed_gesture = Counter(gesture_history).most_common(1)[0][0]
+            smoothed_gesture = Counter(
+                gesture_history
+            ).most_common(1)[0][0]
 
             frame_results.append({
                 "frame": int(frame_number),
                 "time": float(timestamp),
                 "dog_present": True,
-                "dog_confidence": 1.0,
+                "dog_confidence": float(presence["confidence"]),
+                "dog_bbox": presence.get("bbox"),
                 "emotion": {
                     "label": str(canonical_emotion),
                     "raw_label": str(raw_emotion_label),
@@ -585,8 +748,14 @@ async def handle_video_upload(target: UploadFile):
                 },
                 "posture": {
                     "label": str(posture_result.get("label", "Unknown")),
-                    "confidence": float(posture_result.get("confidence", 0.0)),
+                    "confidence": float(
+                        posture_result.get("confidence", 0.0)
+                    ),
                 },
+                "tail": pose_features.get("tail", {}),
+                "ears": pose_features.get("ears", {}),
+                "head": pose_features.get("head", {}),
+                "paw": pose_features.get("paw", {}),
                 "tail_low": bool(pose_cues["tail_low"]),
                 "vocalization": {
                     "label": str(vocalization_label),
@@ -600,7 +769,7 @@ async def handle_video_upload(target: UploadFile):
 
             frame_number += 1
 
-        valid = frame_results
+        valid = [r for r in frame_results if r["dog_present"]]
 
         if valid:
             gesture_counts = Counter(r["gesture"] for r in valid)
@@ -617,7 +786,7 @@ async def handle_video_upload(target: UploadFile):
             emotion_counts = Counter()
             motion_counts = Counter()
             posture_counts = Counter()
-            final_gesture = "No movement detected"
+            final_gesture = "No dog detected"
             final_emotion = "Unknown"
             final_motion = "Unknown"
             final_posture = "Unknown"
@@ -631,12 +800,17 @@ async def handle_video_upload(target: UploadFile):
                 "duration_seconds": round(duration, 2),
                 "total_frames": total_frames,
                 "processed_frames": processed_frames,
+                "dog_frames": dog_frames,
+                "dog_frame_ratio": (
+                    round(dog_frames / processed_frames, 3)
+                    if processed_frames else 0.0
+                ),
                 "sample_fps": round(actual_sample_fps, 2),
             },
             "models": {
                 "emotion_active": True,
                 "pose_active": pose_model is not None,
-                "dog_gate_active": False,
+                "dog_gate_active": _dog_detector_available,
             },
             "final_fusion": {
                 "gesture": final_gesture,
@@ -649,6 +823,8 @@ async def handle_video_upload(target: UploadFile):
             "emotion_counts": dict(emotion_counts),
             "motion_counts": dict(motion_counts),
             "posture_counts": dict(posture_counts),
+            "tail_wagging_frames": int(sum(1 for r in valid if r.get("tail", {}).get("wagging"))),
+            "tail_moving_frames": int(sum(1 for r in valid if r.get("tail", {}).get("moving"))),
             "frames": frame_results,
         }
 

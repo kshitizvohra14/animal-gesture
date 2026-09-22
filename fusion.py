@@ -1,77 +1,54 @@
 """
-fusion.py — Combines emotion, motion, vocalization, and pose-derived cues
-(posture, tail carriage, gait) into a single "gesture" description, using
-a weighted cue-matching engine rather than a flat rule table.
+fusion.py
 
-Design principles:
+Multimodal gesture fusion for Paw Fussion.
 
-1. Emotion is a HARD GATE, not just another weighted cue. Each gesture
-   requires a specific emotion; if the observed emotion doesn't match, the
-   gesture scores 0 and can never win — this is what stops an angry,
-   barking, running dog from ever being read as a playful gesture, and
-   what guarantees different emotions produce different top gestures
-   rather than collapsing onto whichever gesture has the loosest cues.
+Inputs:
+    - emotion
+    - motion
+    - vocalization
+    - posture
+    - tail position / wagging
+    - ears
+    - head direction
+    - raised paw
 
-2. Every cue a gesture can require is registered in POSE_CUES up front.
-   Gestures are built FROM that registry, not the other way around — so
-   it's structurally impossible to reference an undocumented cue.
-
-3. Only cues we can ACTUALLY measure from the current pipeline are used.
-   Cues like "hackles raised" or a true play-bow posture (front legs down,
-   rear up) aren't measured by anything in this project, so they're never
-   defined as gesture requirements — an unmeasurable cue left in a
-   gesture's requirements would always read as "not matched," silently
-   capping that gesture's score rather than ever letting it win by luck.
-
-4. The reported score is a genuine match fraction (matched cue weight /
-   total required weight), scaled by how confident the underlying signals
-   actually were. It is not a deep-model probability and is not labeled
-   as one, and it can't be inflated by cues that were never measured.
-
-5. threshold = 0.6 — a fusion result below this reports the plain
-   composite description instead of forcing a weak winner via tie-break.
-
-6. EMOTION_CANONICAL decouples this file from whatever exact class-name
-   strings model.py's trained classifier happens to use (dataset folder
-   names like "smileydogs"/"gooddogs" are common in public dog-emotion
-   sets, and differ across datasets). Gestures are always written against
-   the canonical Happy/Relaxed/Sad/Angry/Uncertain space; raw labels are
-   normalized through this map once, not scattered as string comparisons
-   throughout the scoring logic.
-
-7. Every result carries a "line" key: the whole prediction as ONE
-   plain-ASCII line (no newlines), e.g.
-       Dog gesture: Excited play chase (score 0.82) | Happy 87% | Running | Barking
-   Use fuse_line() / fuse_frame_line() if you only want that string.
+The fusion engine does NOT claim that a single cue proves an emotion.
+Instead it combines the available signals and reports which behavior rule
+matched best.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
-# ----------------------------------------------------------------------
-# Cue registry. Every cue referenced by any gesture below MUST appear
-# here — this file's own consistency (checked at import time) depends on
-# gestures never reaching for a cue this dict doesn't define.
-# ----------------------------------------------------------------------
+# ============================================================
+# CUE REGISTRY
+# ============================================================
+
 POSE_CUES = {
-    "still": "Motion signal reports Still",
-    "walking": "Motion signal reports Walking",
-    "running": "Motion signal reports Running",
-    "sitting": "Posture signal reports Sitting",
-    "standing": "Posture signal reports Standing",
-    "lying": "Posture signal reports Lying",
-    "tail_low": "Tail held low/tucked, from pose keypoints",
-    "barking": "Vocalization signal reports Barking",
-    "growling": "Vocalization signal reports Growling",
-    "howling": "Vocalization signal reports Howling",
-    "whimpering": "Vocalization signal reports Whimpering",
-    "quiet": "Vocalization signal reports Quiet / no vocalization",
+    "still": "Motion is Still",
+    "walking": "Motion is Walking",
+    "running": "Motion is Running",
+    "sitting": "Posture is Sitting",
+    "standing": "Posture is Standing",
+    "lying": "Posture is Lying",
+    "tail_low": "Tail position is Low",
+    "tail_raised": "Tail position is Raised",
+    "tail_moving": "Tail is moving",
+    "tail_wagging": "Tail shows repeated side-to-side motion",
+    "ears_forward": "Ears are oriented forward",
+    "ears_back": "Ears are oriented backward",
+    "head_left": "Head is turned left",
+    "head_right": "Head is turned right",
+    "paw_raised": "A front paw is raised",
+    "barking": "Vocalization is Barking",
+    "growling": "Vocalization is Growling",
+    "howling": "Vocalization is Howling",
+    "whimpering": "Vocalization is Whimpering",
+    "quiet": "No recent vocalization was detected",
 }
 
-# Raw class-name strings (however your trained model/dataset spells them)
-# -> canonical emotion categories that GESTURES is written against. Add
-# entries here if you train on a dataset with different folder names —
-# nothing else in this file needs to change.
 EMOTION_CANONICAL = {
     "smileydogs": "Happy",
     "gooddogs": "Relaxed",
@@ -82,31 +59,58 @@ EMOTION_CANONICAL = {
     "sad": "Sad",
     "angry": "Angry",
     "uncertain": "Uncertain",
+    "unknown": "Uncertain",
 }
 
 
 def _canonicalize(label: str) -> str:
-    return EMOTION_CANONICAL.get(label.lower(), label)
+    if label is None:
+        return "Uncertain"
+    text = str(label).strip()
+    return EMOTION_CANONICAL.get(text.lower(), text)
+
+
+def _clamp01(value) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cue_active(value: Any):
+    """Return (is_active, confidence) for bool/number/dict cue values."""
+    if isinstance(value, dict):
+        active = bool(value.get("active", value.get("value", False)))
+        confidence = _clamp01(value.get("confidence", 1.0 if active else 0.0))
+        return active, confidence
+
+    if isinstance(value, bool):
+        return value, 1.0 if value else 0.0
+
+    if isinstance(value, (int, float)):
+        confidence = _clamp01(value)
+        return confidence >= 0.5, confidence
+
+    if isinstance(value, str):
+        return value not in {"", "Unknown", "None", "False"}, 1.0
+
+    return False, 0.0
 
 
 @dataclass
 class Gesture:
     name: str
-    required_emotion: str  # hard gate -- must canonically match the observed emotion
-    cues: dict = field(default_factory=dict)  # {cue_name: weight}, cue_name must be in POSE_CUES
+    required_emotion: str
+    cues: dict = field(default_factory=dict)
+    min_match: float = 0.60
     required_emotion_canonical: str = field(init=False)
 
     def __post_init__(self):
-        # Normalize once at definition time, not on every scoring call --
-        # this is looked up ~14 times per /predict request otherwise.
         self.required_emotion_canonical = _canonicalize(self.required_emotion)
 
 
 @dataclass
 class SignalFrame:
-    """Optional structured container for one frame of signals -- use this
-    or the positional fuse() arguments, whichever reads better at the call
-    site. See fuse_frame() below."""
     emotion_label: str
     emotion_conf: float
     motion_label: str
@@ -115,182 +119,284 @@ class SignalFrame:
     pose_cues: dict = None
 
 
+# ============================================================
+# BEHAVIOR RULES
+# ============================================================
+
 GESTURES = [
-    # --- Happy ---
-    Gesture("Excited play chase", "Happy", {"running": 1.0, "barking": 1.0}),
-    Gesture("Playful run", "Happy", {"running": 1.0, "quiet": 0.5}),
-    Gesture("Cheerful walk", "Happy", {"walking": 1.0}),
-    Gesture("Happy greeting bark", "Happy", {"standing": 0.5, "barking": 1.0}),
-    Gesture("Content and relaxed", "Happy", {"sitting": 1.0, "quiet": 1.0}),
+    # Happy
+    Gesture("Excited play", "Happy", {"running": 1.0, "tail_wagging": 1.2, "paw_raised": 0.4}),
+    Gesture("Playful walk", "Happy", {"walking": 1.0, "tail_wagging": 1.1}),
+    Gesture("Happy greeting", "Happy", {"standing": 0.6, "tail_wagging": 1.2, "paw_raised": 0.5}),
+    Gesture("Happy greeting bark", "Happy", {"standing": 0.5, "barking": 1.2, "tail_wagging": 0.8}),
+    Gesture("Cheerful and relaxed", "Happy", {"sitting": 0.8, "tail_moving": 0.6, "quiet": 0.5}),
 
-    # --- Relaxed ---
-    Gesture("Casual walk", "Relaxed", {"walking": 1.0}),
-    Gesture("Resting calmly", "Relaxed", {"lying": 1.0, "quiet": 1.0}),
-    Gesture("Alert but calm", "Relaxed", {"sitting": 1.0, "quiet": 1.0}),
+    # Relaxed
+    Gesture("Friendly relaxed greeting", "Relaxed", {"standing": 0.5, "tail_wagging": 1.2, "quiet": 0.4}),
+    Gesture("Casual walk", "Relaxed", {"walking": 1.0, "tail_moving": 0.7}),
+    Gesture("Resting calmly", "Relaxed", {"lying": 1.1, "still": 0.9, "quiet": 0.5}),
+    Gesture("Alert but calm", "Relaxed", {"sitting": 0.8, "ears_forward": 0.7, "quiet": 0.5}),
 
-    # --- Sad ---
-    Gesture("Distress whimper", "Sad", {"whimpering": 1.0, "still": 0.5}),
-    Gesture("Withdrawn / low mood", "Sad", {"lying": 1.0, "quiet": 1.0}),
-    Gesture("Anxious pacing", "Sad", {"walking": 1.0, "tail_low": 1.0}),
+    # Sad
+    Gesture("Distress whimper", "Sad", {"whimpering": 1.2, "still": 0.7, "tail_low": 0.7}),
+    Gesture("Withdrawn / low energy", "Sad", {"lying": 1.0, "tail_low": 0.9, "still": 0.8}),
+    Gesture("Anxious pacing", "Sad", {"walking": 1.0, "tail_low": 1.1}),
 
-    # --- Angry ---
-    Gesture("Alert / warning bark", "Angry", {"barking": 1.0, "standing": 0.5}),
-    Gesture("Defensive growl", "Angry", {"growling": 1.0}),
-    Gesture("Tense / on guard", "Angry", {"still": 1.0, "standing": 1.0}),
+    # Angry
+    Gesture("Alert / warning bark", "Angry", {"barking": 1.2, "standing": 0.5, "ears_forward": 0.7}),
+    Gesture("Defensive growl", "Angry", {"growling": 1.2, "tail_raised": 0.7, "standing": 0.4}),
+    Gesture("Tense / on guard", "Angry", {"standing": 0.8, "tail_raised": 0.8, "ears_forward": 0.8}),
 
-    # --- Uncertain (emotion confidence gate failed) -- still gives a
-    #     meaningful reading from motion/posture/vocalization alone,
-    #     instead of always falling through to the generic composite. ---
-    Gesture("Attentive / observing", "Uncertain", {"standing": 1.0, "quiet": 0.5}),
-    Gesture("Resting / observing", "Uncertain", {"lying": 1.0, "quiet": 1.0}),
+    # Uncertain emotion
+    Gesture("Attentive / observing", "Uncertain", {"standing": 1.0, "ears_forward": 0.8}),
+    Gesture("Resting / observing", "Uncertain", {"lying": 1.0, "still": 0.7}),
 ]
 
-# Any cue used above that isn't registered in POSE_CUES is a bug in this
-# file, not in the caller -- fail loudly at import time.
-_undocumented = sorted({cue for g in GESTURES for cue in g.cues} - set(POSE_CUES))
+_undocumented = sorted({cue for gesture in GESTURES for cue in gesture.cues} - set(POSE_CUES))
 if _undocumented:
-    raise ValueError(f"fusion.py: cues used by gestures but missing from POSE_CUES: {_undocumented}")
+    raise ValueError(f"fusion.py: undocumented cues: {_undocumented}")
 
 
-def format_line(gesture: str, matched: bool, score: float, emotion: str,
-                motion: str, vocalization: str, emotion_conf: float = None) -> str:
-    """
-    Renders one fusion result as a SINGLE plain-ASCII line, e.g.
-
-        Dog gesture: Excited play chase (score 0.82) | Happy 87% | Running | Barking
-        Dog gesture: no confident match | Happy 87% | Running | Quiet
-
-    ASCII-only on purpose so print() never fails on a Windows cp1252 console.
-    """
-    emo = f"{emotion} {emotion_conf:.0%}" if emotion_conf is not None else f"{emotion}"
-    signals = f"{emo} | {motion} | {vocalization}"
-    if matched:
-        line = f"Dog gesture: {gesture} (score {score:.2f}) | {signals}"
-    else:
-        line = f"Dog gesture: no confident match | {signals}"
-    # Guarantee "one line" even if a label ever arrives with a newline in it.
-    return " ".join(line.split())
-
+# ============================================================
+# ENGINE
+# ============================================================
 
 class FusionEngine:
-    def __init__(self, threshold: float = 0.6):
-        self.threshold = threshold  # a match below this is reported as a plain composite, not forced to win
+    def __init__(self, threshold: float = 0.60):
+        self.threshold = float(threshold)
 
-    def _active_cues(self, motion_label, vocalization_label, pose_cues) -> set:
-        """Builds the set of currently-true cue names from the raw signals."""
-        active = set()
+    def _active_cues(self, motion_label, vocalization_label, pose_cues):
+        active = {}
 
         motion_map = {"Still": "still", "Walking": "walking", "Running": "running"}
         if motion_label in motion_map:
-            active.add(motion_map[motion_label])
+            active[motion_map[motion_label]] = 1.0
 
-        vocal_map = {"Barking": "barking", "Growling": "growling", "Howling": "howling",
-                     "Whimpering": "whimpering", "Quiet": "quiet"}
+        vocal_map = {
+            "Barking": "barking",
+            "Growling": "growling",
+            "Howling": "howling",
+            "Whimpering": "whimpering",
+            "Quiet": "quiet",
+        }
         if vocalization_label in vocal_map:
-            active.add(vocal_map[vocalization_label])
+            cue = vocal_map[vocalization_label]
+            confidence = 1.0
+            if isinstance(pose_cues, dict):
+                confidence = _clamp01(pose_cues.get("vocal_conf", 1.0))
+            active[cue] = confidence
 
         pose_cues = pose_cues or {}
-        posture = pose_cues.get("posture")
-        posture_map = {"Sitting": "sitting", "Standing": "standing", "Lying": "lying"}
-        if posture in posture_map:
-            active.add(posture_map[posture])
 
-        if pose_cues.get("tail_low"):
-            active.add("tail_low")
+        posture_map = {
+            "Sitting": "sitting",
+            "Standing": "standing",
+            "Lying": "lying",
+        }
+        posture = pose_cues.get("posture")
+        if posture in posture_map:
+            active[posture_map[posture]] = _clamp01(pose_cues.get("posture_confidence", 1.0))
+
+        # Boolean / score-based cues from pose_motion.py.
+        cue_aliases = {
+            "tail_low": "tail_low",
+            "tail_raised": "tail_raised",
+            "tail_moving": "tail_moving",
+            "tail_wagging": "tail_wagging",
+            "ears_forward": "ears_forward",
+            "ears_back": "ears_back",
+            "head_left": "head_left",
+            "head_right": "head_right",
+            "paw_raised": "paw_raised",
+        }
+
+        for key, cue_name in cue_aliases.items():
+            if key not in pose_cues:
+                continue
+            is_active, confidence = _cue_active(pose_cues[key])
+            if is_active:
+                active[cue_name] = confidence
+
+        # More convenient structured inputs from PoseStateTracker.
+        tail = pose_cues.get("tail")
+        if isinstance(tail, dict):
+            if tail.get("low"):
+                active["tail_low"] = _clamp01(tail.get("position_confidence", 1.0))
+            if tail.get("raised"):
+                active["tail_raised"] = _clamp01(tail.get("position_confidence", 1.0))
+            if tail.get("moving"):
+                active["tail_moving"] = max(_clamp01(tail.get("movement_score", 0.0) * 4.0), 0.5)
+            if tail.get("wagging"):
+                active["tail_wagging"] = max(_clamp01(tail.get("wag_score", 0.0)), 0.5)
+
+        ears = pose_cues.get("ears")
+        if isinstance(ears, dict):
+            label = ears.get("label")
+            if label == "Forward":
+                active["ears_forward"] = _clamp01(ears.get("confidence", 1.0))
+            elif label == "Back":
+                active["ears_back"] = _clamp01(ears.get("confidence", 1.0))
+
+        head = pose_cues.get("head")
+        if isinstance(head, dict):
+            label = head.get("label")
+            if label == "Left":
+                active["head_left"] = _clamp01(head.get("confidence", 1.0))
+            elif label == "Right":
+                active["head_right"] = _clamp01(head.get("confidence", 1.0))
+
+        paw = pose_cues.get("paw")
+        if isinstance(paw, dict):
+            label = str(paw.get("label", "None"))
+            if label and label != "None":
+                active["paw_raised"] = _clamp01(paw.get("confidence", 1.0))
 
         return active
 
-    def _score_gesture(self, gesture: Gesture, emotion_canonical: str, active_cues: set) -> float:
-        """
-        Returns a match fraction in [0, 1]. A cue not present in active_cues
-        counts as NOT matched (0 contribution) -- never skipped, so a
-        gesture can't win by having most of its required cues simply
-        unmeasured. Emotion mismatch is a hard 0.
-        """
-        if gesture.required_emotion_canonical != emotion_canonical:
-            return 0.0
+    def _score_gesture(self, gesture: Gesture, emotion, active):
+        if gesture.required_emotion_canonical != emotion:
+            return 0.0, []
+
         if not gesture.cues:
-            return 0.0
+            return 0.0, []
 
-        total_weight = sum(gesture.cues.values())
-        matched_weight = sum(w for cue, w in gesture.cues.items() if cue in active_cues)
-        return matched_weight / total_weight if total_weight > 0 else 0.0
+        total = sum(float(weight) for weight in gesture.cues.values())
+        matched = 0.0
+        matched_cues = []
 
-    def select(self, emotion_label, emotion_conf, motion_label, vocalization_label,
-               vocal_conf=None, pose_cues=None) -> dict:
-        emotion_canonical = _canonicalize(emotion_label)
-        active_cues = self._active_cues(motion_label, vocalization_label, pose_cues)
+        for cue, weight in gesture.cues.items():
+            confidence = float(active.get(cue, 0.0))
+            if confidence > 0:
+                matched += float(weight) * confidence
+                matched_cues.append({"cue": cue, "confidence": round(confidence, 3)})
 
-        scored = [(g, self._score_gesture(g, emotion_canonical, active_cues)) for g in GESTURES]
-        best_gesture, best_match = max(scored, key=lambda pair: pair[1], default=(None, 0.0))
+        return (matched / total if total > 0 else 0.0), matched_cues
 
-        def _result(gesture_name, matched, score):
+    def select(self, emotion_label, emotion_conf, motion_label,
+               vocalization_label, vocal_conf=None, pose_cues=None):
+        emotion = _canonicalize(emotion_label)
+        emotion_conf = _clamp01(emotion_conf)
+        active = self._active_cues(motion_label, vocalization_label, {
+            **(pose_cues or {}),
+            "vocal_conf": vocal_conf if vocal_conf is not None else 1.0,
+        })
+
+        scored = []
+        for gesture in GESTURES:
+            match_score, matched_cues = self._score_gesture(gesture, emotion, active)
+            scored.append((gesture, match_score, matched_cues))
+
+        best_gesture, best_match, matched_cues = max(
+            scored,
+            key=lambda item: item[1],
+            default=(None, 0.0, []),
+        )
+
+        # Emotion confidence is a reliability factor, not a replacement for
+        # the cue-match score. When emotion is Uncertain, it remains possible
+        # to produce an observation-style reading from pose cues.
+        if best_gesture is None or best_match < max(self.threshold, best_gesture.min_match):
+            fallback = f"{emotion} | {motion_label} | {vocalization_label}"
             return {
-                "gesture": gesture_name,
-                "matched_rule": matched,
-                "score": score,
-                "line": format_line(gesture_name, matched, score, emotion_canonical,
-                                    motion_label, vocalization_label, emotion_conf),
+                "gesture": fallback,
+                "matched_rule": False,
+                "score": 0.0,
+                "match_score": 0.0,
+                "confidence": emotion_conf,
+                "matched_cues": [],
+                "active_cues": sorted(active.keys()),
+                "line": format_line(fallback, False, 0.0, emotion,
+                                     motion_label, vocalization_label, emotion_conf),
             }
 
-        if best_gesture is None or best_match < self.threshold:
-            return _result(f"{emotion_canonical} · {motion_label} · {vocalization_label}", False, 0.0)
+        # Only the signals actually used by this rule contribute to the final
+        # reliability score.
+        reliability = [emotion_conf]
+        for item in matched_cues:
+            cue = item["cue"]
+            if cue in {"barking", "growling", "howling", "whimpering", "quiet"} and vocal_conf is not None:
+                reliability.append(_clamp01(vocal_conf))
+            else:
+                reliability.append(_clamp01(item["confidence"]))
 
-        # Blend in the real confidences of whichever signals actually
-        # contributed a matched cue -- never a hardcoded stand-in.
-        confidences = [c for c in [emotion_conf] if c is not None]
-        used_vocal = any(cue in active_cues and cue in ("barking", "growling", "howling", "whimpering", "quiet")
-                          for cue in best_gesture.cues)
-        if used_vocal and vocal_conf is not None:
-            confidences.append(vocal_conf)
-        blended_confidence = sum(confidences) / len(confidences) if confidences else 1.0
+        mean_reliability = sum(reliability) / max(1, len(reliability))
+        final_score = round(best_match * mean_reliability, 3)
 
-        final_score = round(best_match * blended_confidence, 3)
+        return {
+            "gesture": best_gesture.name,
+            "matched_rule": True,
+            "score": final_score,
+            "match_score": round(best_match, 3),
+            "confidence": round(mean_reliability, 3),
+            "matched_cues": matched_cues,
+            "active_cues": sorted(active.keys()),
+            "line": format_line(best_gesture.name, True, final_score, emotion,
+                                motion_label, vocalization_label, emotion_conf),
+        }
 
-        return _result(best_gesture.name, True, final_score)
+
+_engine = FusionEngine(threshold=0.60)
 
 
-# Module-level engine instance -- callers reference this directly
-# (fusion._engine.threshold, etc.) rather than constructing their own.
-_engine = FusionEngine(threshold=0.6)
+def format_line(gesture, matched, score, emotion, motion, vocalization, emotion_conf=None):
+    emo = f"{emotion} {emotion_conf:.0%}" if emotion_conf is not None else emotion
+    signals = f"{emo} | {motion} | {vocalization}"
+    if matched:
+        return " ".join(f"Dog gesture: {gesture} (score {score:.2f}) | {signals}".split())
+    return " ".join(f"Dog gesture: no confident match | {signals}".split())
 
 
 def fuse(emotion_label: str, emotion_conf: float, motion_label: str,
-         vocalization_label: str, vocal_conf: float = None, pose_cues: dict = None) -> dict:
-    """
-    pose_cues: optional dict, e.g. {"posture": "Standing", "tail_low": False}.
-    Pass whatever you have -- missing keys just mean those cues are never
-    "active" and can't contribute to any gesture's score.
-
-    Returns {"gesture", "matched_rule", "score", "line"}; "line" is the
-    whole prediction as one string.
-    """
-    return _engine.select(emotion_label, emotion_conf, motion_label,
-                           vocalization_label, vocal_conf, pose_cues)
+         vocalization_label: str, vocal_conf: float = None,
+         pose_cues: dict = None) -> dict:
+    return _engine.select(
+        emotion_label,
+        emotion_conf,
+        motion_label,
+        vocalization_label,
+        vocal_conf,
+        pose_cues,
+    )
 
 
 def fuse_line(emotion_label: str, emotion_conf: float, motion_label: str,
-              vocalization_label: str, vocal_conf: float = None, pose_cues: dict = None) -> str:
-    """Same as fuse(), but returns ONLY the single-line string."""
-    return fuse(emotion_label, emotion_conf, motion_label,
-                vocalization_label, vocal_conf, pose_cues)["line"]
+              vocalization_label: str, vocal_conf: float = None,
+              pose_cues: dict = None) -> str:
+    return fuse(
+        emotion_label,
+        emotion_conf,
+        motion_label,
+        vocalization_label,
+        vocal_conf,
+        pose_cues,
+    )["line"]
 
 
 def fuse_frame(frame: SignalFrame) -> dict:
-    """Same as fuse(), but takes a SignalFrame instead of positional args --
-    convenient when you're already assembling one for logging/serialization."""
-    return fuse(frame.emotion_label, frame.emotion_conf, frame.motion_label,
-                frame.vocalization_label, frame.vocal_conf, frame.pose_cues)
+    return fuse(
+        frame.emotion_label,
+        frame.emotion_conf,
+        frame.motion_label,
+        frame.vocalization_label,
+        frame.vocal_conf,
+        frame.pose_cues,
+    )
 
 
 def fuse_frame_line(frame: SignalFrame) -> str:
-    """Same as fuse_frame(), but returns ONLY the single-line string."""
     return fuse_frame(frame)["line"]
 
 
 if __name__ == "__main__":
-    # Quick smoke demo: python fusion.py
-    print(fuse_line("happy", 0.87, "Running", "Barking"))
-    print(fuse_line("angry", 0.74, "Still", "Growling", vocal_conf=0.9,
-                    pose_cues={"posture": "Standing"}))
-    print(fuse_line("sad", 0.55, "Walking", "Quiet"))
+    tests = [
+        ("Happy", 0.87, "Running", "Barking",
+         {"tail": {"wagging": True, "wag_score": 0.88}, "posture": "Standing"}),
+        ("Happy", 0.84, "Walking", "Quiet",
+         {"tail": {"wagging": True, "wag_score": 0.78}, "posture": "Standing"}),
+        ("Relaxed", 0.81, "Still", "Quiet",
+         {"posture": "Lying"}),
+        ("Angry", 0.82, "Still", "Growling",
+         {"posture": "Standing", "tail": {"raised": True, "position_confidence": 0.75}}),
+    ]
+    for args in tests:
+        print(fuse_line(*args[:-1], pose_cues=args[-1]))

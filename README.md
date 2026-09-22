@@ -133,6 +133,25 @@ this same architecture: repetitive head-shaking/scratching (high-frequency small
 ear keypoint motion), reduced range of motion over a session (knee/elbow angle variability
 trending down), or asymmetric weight-bearing while standing still (not just mid-gait).
 
+## Important OOD / Human-Rejection Gate
+
+The dog emotion classifier is **not** a dog-vs-human classifier. Without a
+separate gate, a human image can still receive a high softmax score for
+Happy/Relaxed/Sad/Angry because a softmax classifier must choose one of its
+known classes.
+
+This version fixes that failure mode:
+
+1. YOLO detects a COCO `dog` first.
+2. If no dog is detected above the confidence threshold, inference stops.
+3. Only the detected dog crop is passed to the emotion and pose models.
+4. Video frames without a dog are excluded from fusion and reset temporal state.
+5. If the YOLO detector cannot load, the system **fails closed** instead of
+   assuming every frame is a dog.
+
+Default dog-detection threshold: `0.55`. You can change it with
+`DOG_DETECTOR_MIN_CONFIDENCE`.
+
 ## Known limitations of this prototype
 
 - **Motion (pixel-diff fallback) is a heuristic, not a trained model.** Frame-differencing
@@ -173,3 +192,43 @@ trending down), or asymmetric weight-bearing while standing still (not just mid-
   consider adding a detector to crop the dog/face first if you run into this.
 - **4 broad emotion classes.** Swap `CLASSES` in `model.py` (and your data folders)
   if you want a different taxonomy (e.g. DEBIw's aggression/anxiety/contentment/fear).
+
+
+## Human-rejection dog gate
+
+The visual pipeline has a mandatory two-stage architecture:
+
+`camera/upload -> COCO YOLO dog detector -> dog crop -> emotion/pose -> fusion`
+
+The emotion model is **not** a dog-vs-human classifier. It is a four-class dog
+emotion model, so it must never receive an arbitrary human frame directly.
+
+### Required dog detector
+
+Place `yolo11n.pt` beside `app.py`, or set:
+
+```text
+DOG_DETECTOR_WEIGHTS=C:\\path\\to\\yolo11n.pt
+```
+
+Ultralytics will attempt to resolve the official `yolo11n.pt` asset when the
+standard filename is used and the environment has network access.
+
+### Verify before starting FastAPI
+
+```bash
+python test_dog_detector.py human.jpg
+python test_dog_detector.py dog.jpg
+```
+
+A human image should print `present: False`. A dog image should print
+`present: True` with a confidence score.
+
+The backend also exposes:
+
+```text
+GET /dog_gate_status
+```
+
+The frontend cannot bypass the gate; older `skip_dog_gate` client fields are
+accepted for compatibility but ignored by the server.
