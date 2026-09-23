@@ -15,7 +15,7 @@ from ultralytics import YOLO
 
 COCO_DOG_CLASS_ID = 16
 MIN_DETECTION_CONFIDENCE = float(
-    os.environ.get("DOG_DETECTOR_MIN_CONFIDENCE", "0.45")
+    os.environ.get("DOG_DETECTOR_MIN_CONFIDENCE", "0.55")
 )
 
 BASE_DIR = Path(__file__).resolve().parent
