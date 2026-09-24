@@ -74,9 +74,9 @@ CLASSES = _load_class_names()
 
 # Gating thresholds calibrated against validation frames to reject flat/out-of-distribution frames
 # Label-smoothing during training keeps softmax from reaching very high values;
-# 0.55 / 0.12 are calibrated to pass real detections while filtering flat noise.
-MIN_CONFIDENCE = float(os.environ.get("DOG_EMOTION_MIN_CONFIDENCE", 0.55))
-MIN_MARGIN = float(os.environ.get("DOG_EMOTION_MIN_MARGIN", 0.12))
+# 0.45 / 0.08 are calibrated to pass real detections while filtering flat noise.
+MIN_CONFIDENCE = float(os.environ.get("DOG_EMOTION_MIN_CONFIDENCE", 0.45))
+MIN_MARGIN = float(os.environ.get("DOG_EMOTION_MIN_MARGIN", 0.08))
 
 
 def build_model(num_classes: int = len(CLASSES)) -> tf.keras.Model:

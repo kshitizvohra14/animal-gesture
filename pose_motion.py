@@ -47,6 +47,12 @@ WALKING_MAX = 0.085
 MOTION_HISTORY = 5
 POSTURE_HISTORY = 5
 
+# How many *consecutive* missed-detection frames we tolerate before treating
+# the dog as genuinely gone and clearing temporal state. At typical video
+# frame rates this is well under half a second, so it absorbs normal
+# detector jitter without erasing motion continuity.
+MAX_MISSED_FRAMES = 5
+
 TAIL_HISTORY = 12
 TAIL_DEADBAND = 0.06
 TAIL_WAG_MIN_AMPLITUDE = 0.22
@@ -74,10 +80,25 @@ def _mean_valid(points):
     return np.mean(vals, axis=0) if vals else None
 
 
-def _body_scale(kpts):
+def _body_scale(kpts, bbox_diagonal=None):
+    # Prefer the withers-nose distance when both are reliably detected --
+    # it's the most anatomically precise measure of dog size in-frame.
     scale = _distance(kpts[KP["withers"]], kpts[KP["nose"]])
     if scale >= 5:
         return scale
+
+    # Next best: the detector's bounding-box diagonal. It's available every
+    # frame the dog is detected and, unlike keypoints, doesn't flicker based
+    # on which individual points happened to pass the confidence gate this
+    # frame -- so it gives a stable normalization reference even when
+    # withers/nose are missing.
+    if bbox_diagonal and bbox_diagonal > 0:
+        return float(bbox_diagonal)
+
+    # Last resort only: span of whatever points are currently valid. This is
+    # unstable frame-to-frame (the *set* of valid points changes as
+    # confidence flickers), which was previously causing phantom motion on a
+    # perfectly still dog -- avoid it whenever bbox_diagonal is available.
     vals = [np.asarray(p, dtype=np.float32) for p in kpts if _valid_point(p)]
     if len(vals) >= 2:
         arr = np.vstack(vals)
@@ -86,7 +107,7 @@ def _body_scale(kpts):
     return 1.0
 
 
-def _normalize_keypoints(kpts):
+def _normalize_keypoints(kpts, bbox_diagonal=None):
     if kpts is None or len(kpts) < len(KEYPOINT_NAMES):
         return None
 
@@ -94,9 +115,16 @@ def _normalize_keypoints(kpts):
     if not _valid_point(anchor):
         anchor = _mean_valid([kpts[KP["withers"]], kpts[KP["throat"]]])
     if anchor is None:
+        # withers/throat are frequently missing for some breeds/angles
+        # (fluffy coats, head-down poses, top-down camera views). Losing
+        # them should not disable motion scoring entirely -- fall back to
+        # the centroid of whatever keypoints ARE valid (e.g. the paws)
+        # as an approximate body-center anchor.
+        anchor = _mean_valid(kpts)
+    if anchor is None:
         return None
 
-    scale = _body_scale(kpts)
+    scale = _body_scale(kpts, bbox_diagonal)
     arr = np.asarray(kpts, dtype=np.float32)
     out = np.zeros_like(arr)
     for i, p in enumerate(arr):
@@ -167,22 +195,32 @@ def extract_keypoints(pose_model, bgr_frame):
     return kpts, max(diagonal, 1.0), best_conf
 
 
-def _motion_score(prev_kpts, curr_kpts):
-    prev = _normalize_keypoints(prev_kpts)
-    curr = _normalize_keypoints(curr_kpts)
-    if prev is None or curr is None:
-        return None
+def _motion_score(prev_kpts, curr_kpts, bbox_diagonal=None):
+    prev = _normalize_keypoints(prev_kpts, bbox_diagonal)
+    curr = _normalize_keypoints(curr_kpts, bbox_diagonal)
 
-    values = []
-    for idx in PAW_INDICES:
-        if _valid_point(prev_kpts[idx]) and _valid_point(curr_kpts[idx]):
-            values.append(float(np.linalg.norm(curr[idx] - prev[idx])))
+    if prev is not None and curr is not None:
+        values = []
+        for idx in PAW_INDICES:
+            if _valid_point(prev_kpts[idx]) and _valid_point(curr_kpts[idx]):
+                values.append(float(np.linalg.norm(curr[idx] - prev[idx])))
+        if len(values) >= 2:
+            # Median rejects one badly jittering paw.
+            return float(np.median(values))
 
-    if len(values) < 2:
-        return None
+    # Safety-net fallback: normalization failed outright (e.g. no valid
+    # anchor at all on one of the two frames). Fall back to raw pixel
+    # displacement of the paws, normalized by the bbox diagonal, rather
+    # than silently reporting zero motion.
+    if bbox_diagonal and bbox_diagonal > 0:
+        values = []
+        for idx in PAW_INDICES:
+            if _valid_point(prev_kpts[idx]) and _valid_point(curr_kpts[idx]):
+                values.append(_distance(prev_kpts[idx], curr_kpts[idx]) / bbox_diagonal)
+        if len(values) >= 2:
+            return float(np.median(values))
 
-    # Median rejects one badly jittering paw.
-    return float(np.median(values))
+    return None
 
 
 def classify_motion_from_pose(prev_kpts, curr_kpts, bbox_diagonal=None):
@@ -195,7 +233,7 @@ def classify_motion_from_pose(prev_kpts, curr_kpts, bbox_diagonal=None):
     if prev_kpts is None or curr_kpts is None:
         return {"label": "Still", "score": 0.0, "confidence": 0.0}
 
-    score = _motion_score(prev_kpts, curr_kpts)
+    score = _motion_score(prev_kpts, curr_kpts, bbox_diagonal)
     if score is None:
         return {"label": "Still", "score": 0.0, "confidence": 0.0}
 
@@ -222,22 +260,71 @@ def _valid_names(kpts, names, minimum=None):
     return len(valid) >= (minimum if minimum is not None else len(names))
 
 
+def _posture_anchor(kpts):
+    """
+    Find a usable "back/shoulder height" reference point for posture geometry.
+
+    withers is the ideal anchor, but it is frequently NOT detected for some
+    breeds/coats/angles (e.g. fluffy dogs, head-down poses, top-down camera
+    views) -- which previously made classify_posture() bail out to Unknown
+    even when plenty of other geometry (paws, knees, nose) was available.
+    Fall back through progressively rougher but still usable approximations
+    of the same body-height reference, each with a confidence penalty since
+    they are less precise than a true withers point.
+    """
+    if _valid_point(kpts[KP["withers"]]):
+        return np.asarray(kpts[KP["withers"]], dtype=np.float32), 1.0
+
+    if _valid_point(kpts[KP["throat"]]):
+        return np.asarray(kpts[KP["throat"]], dtype=np.float32), 0.85
+
+    shoulders = [kpts[KP[n]] for n in ("front_left_elbow", "front_right_elbow")
+                 if _valid_point(kpts[KP[n]])]
+    if shoulders:
+        return np.mean([np.asarray(p, dtype=np.float32) for p in shoulders],
+                        axis=0), 0.75
+
+    if _valid_point(kpts[KP["nose"]]):
+        return np.asarray(kpts[KP["nose"]], dtype=np.float32), 0.6
+
+    return None, 0.0
+
+
+def _vertical_spread_ratio(kpts, bbox_diagonal):
+    """
+    Overall vertical extent of whatever keypoints are valid, relative to
+    body size. A lying dog is flat -- its paws, elbows, nose and tail all
+    sit close to the same height. A standing dog is tall -- its head/back
+    sit well above its paws. Unlike a single anchor point, this doesn't
+    depend on any one keypoint (withers, elbow, nose) being the "right"
+    height reference, so it works as a Lying signal even when withers is
+    missing and no trustworthy anchor is available.
+    """
+    if not bbox_diagonal or bbox_diagonal <= 0:
+        return None
+    ys = [float(p[1]) for p in kpts if _valid_point(p)]
+    if len(ys) < 3:
+        return None
+    return (max(ys) - min(ys)) / bbox_diagonal
+
+
 def classify_posture(kpts, bbox_diagonal):
     """
     Tolerant posture classifier.
 
-    It no longer requires all seven leg points. It uses the strongest
-    available geometry and returns Unknown only when the pose genuinely
-    lacks enough information.
+    It no longer requires all seven leg points, nor withers specifically.
+    It uses the strongest available geometry and returns Unknown only when
+    the pose genuinely lacks enough information for any anchor at all.
     """
     if kpts is None or not bbox_diagonal or bbox_diagonal <= 0:
         return {"label": "Unknown", "confidence": 0.0}
 
-    # Core anchor. Without withers there is no reliable body-relative geometry.
-    if not _valid_point(kpts[KP["withers"]]):
+    # Core anchor. Falls back through throat / shoulders / nose when withers
+    # itself isn't detected, rather than giving up immediately.
+    w, anchor_quality = _posture_anchor(kpts)
+    if w is None:
         return {"label": "Unknown", "confidence": 0.0}
 
-    w = np.asarray(kpts[KP["withers"]], dtype=np.float32)
     front_paws = [kpts[KP[n]] for n in ("front_left_paw", "front_right_paw")
                   if _valid_point(kpts[KP[n]])]
     rear_paws = [kpts[KP[n]] for n in ("rear_left_paw", "rear_right_paw")
@@ -245,18 +332,40 @@ def classify_posture(kpts, bbox_diagonal):
     rear_knees = [kpts[KP[n]] for n in ("rear_left_knee", "rear_right_knee")
                   if _valid_point(kpts[KP[n]])]
 
-    # Body height: median paw distance below withers.
+    # Body height: median paw distance below the anchor. This is only a
+    # meaningful "how low is the back" measurement when the anchor is
+    # actually at back/neck height (withers or throat, anchor_quality >=
+    # 0.85). Weaker fallback anchors -- the front-elbow midpoint or the
+    # nose -- sit much closer to the ground than withers even on a fully
+    # standing dog (the elbow is roughly mid-leg height), so re-using the
+    # same "< 0.16" threshold against them falsely called standing dogs
+    # Lying.
     all_paws = front_paws + rear_paws
-    if len(all_paws) >= 2:
+    anchor_trustworthy_for_height = anchor_quality >= 0.85
+    if anchor_trustworthy_for_height and len(all_paws) >= 2:
         paw_y = float(np.median([p[1] for p in all_paws]))
         body_height = (paw_y - w[1]) / bbox_diagonal
     else:
         body_height = None
 
+    is_lying = body_height is not None and body_height < 0.16 and len(all_paws) >= 2
+    lying_confidence = 0.78 * anchor_quality
+
+    # When the anchor isn't trustworthy for a height measurement, fall back
+    # to the anchor-independent vertical-spread signal instead of skipping
+    # the Lying check altogether (which would otherwise mean a genuinely
+    # lying dog is never detected as such whenever withers/throat are
+    # missing).
+    if not anchor_trustworthy_for_height:
+        spread = _vertical_spread_ratio(kpts, bbox_diagonal)
+        if spread is not None and spread < 0.22:
+            is_lying = True
+            lying_confidence = 0.55
+
     # Lying: low body geometry, but avoid calling an upright dog lying just
     # because one paw is missing.
-    if body_height is not None and body_height < 0.16 and len(all_paws) >= 2:
-        return {"label": "Lying", "confidence": 0.78}
+    if is_lying:
+        return {"label": "Lying", "confidence": round(lying_confidence, 3)}
 
     # Sitting: use folded hind-leg geometry. One rear side is enough when
     # front paws are also visible, but confidence is reduced.
@@ -271,27 +380,52 @@ def classify_posture(kpts, bbox_diagonal):
 
     if sitting_votes and any(sitting_votes):
         if len(front_paws) >= 1:
-            return {"label": "Sitting", "confidence": 0.74 if len(sitting_votes) == 2 else 0.62}
+            conf = 0.74 if len(sitting_votes) == 2 else 0.62
+            return {"label": "Sitting", "confidence": round(conf * anchor_quality, 3)}
 
     # A dog with multiple reliable paws and normal body height is standing.
     if len(all_paws) >= 2:
-        return {"label": "Standing", "confidence": 0.72}
+        return {"label": "Standing", "confidence": round(0.72 * anchor_quality, 3)}
 
-    # Front paws + withers + nose provide enough evidence for an upright body
+    # Front paws + anchor + nose provide enough evidence for an upright body
     # in many side-view frames.
     if len(front_paws) >= 2 and _valid_point(kpts[KP["nose"]]):
-        return {"label": "Standing", "confidence": 0.58}
+        return {"label": "Standing", "confidence": round(0.58 * anchor_quality, 3)}
 
     return {"label": "Unknown", "confidence": 0.0}
 
 
 def _tail_lateral_signal(kpts):
-    names = ("withers", "nose", "tail_start", "tail_end")
-    if not all(_valid_point(kpts[KP[n]]) for n in names):
+    # tail_start/tail_end/nose are the geometry we actually care about.
+    # withers was previously *required* just to build a forward-facing body
+    # axis, which meant the whole wag signal silently went to None -- and
+    # wagging could never be detected -- on any frame where withers wasn't
+    # picked up (common for this dog/angle). Build the forward axis from
+    # whatever reliable front-of-body reference is available instead.
+    if not (_valid_point(kpts[KP["tail_start"]]) and
+            _valid_point(kpts[KP["tail_end"]]) and
+            _valid_point(kpts[KP["nose"]])):
         return None
 
-    body = np.asarray(kpts[KP["nose"]], dtype=np.float32) - np.asarray(
-        kpts[KP["withers"]], dtype=np.float32)
+    front_ref = None
+    for name in ("withers", "throat"):
+        if _valid_point(kpts[KP[name]]):
+            front_ref = np.asarray(kpts[KP[name]], dtype=np.float32)
+            break
+    if front_ref is None:
+        elbows = [kpts[KP[n]] for n in ("front_left_elbow", "front_right_elbow")
+                  if _valid_point(kpts[KP[n]])]
+        if elbows:
+            front_ref = np.mean([np.asarray(p, dtype=np.float32) for p in elbows],
+                                 axis=0)
+    if front_ref is None:
+        # Last resort: use tail_start itself as the axis origin (spine
+        # direction approximated as nose -> tail_start). tail_start sits at
+        # the base of the tail against the body and barely moves during a
+        # wag (only tail_end swings), so this stays a stable, usable axis.
+        front_ref = np.asarray(kpts[KP["tail_start"]], dtype=np.float32)
+
+    body = np.asarray(kpts[KP["nose"]], dtype=np.float32) - front_ref
     tail = np.asarray(kpts[KP["tail_end"]], dtype=np.float32) - np.asarray(
         kpts[KP["tail_start"]], dtype=np.float32)
 
@@ -308,11 +442,24 @@ def compute_tail_position(kpts, bbox_diagonal):
     if kpts is None or not bbox_diagonal or bbox_diagonal <= 0:
         return {"label": "Unknown", "confidence": 0.0}
 
-    needed = ("withers", "tail_start", "tail_end")
-    if not all(_valid_point(kpts[KP[n]]) for n in needed):
+    if not (_valid_point(kpts[KP["tail_start"]]) and _valid_point(kpts[KP["tail_end"]])):
         return {"label": "Unknown", "confidence": 0.0}
 
-    wy = float(kpts[KP["withers"]][1])
+    # Low/Raised needs a back-height reference. Only trust withers/throat
+    # for this (same reasoning as posture's Lying check) -- weaker
+    # fallback anchors sit too close to the ground to give a meaningful
+    # "tail relative to back" reading, so we report Unknown rather than a
+    # misleading Low/Raised in that case; wag detection above is unaffected
+    # since it doesn't depend on this height measurement.
+    anchor = None
+    if _valid_point(kpts[KP["withers"]]):
+        anchor = kpts[KP["withers"]]
+    elif _valid_point(kpts[KP["throat"]]):
+        anchor = kpts[KP["throat"]]
+    if anchor is None:
+        return {"label": "Unknown", "confidence": 0.0}
+
+    wy = float(anchor[1])
     ty = float(np.mean([kpts[KP["tail_start"]][1],
                         kpts[KP["tail_end"]][1]]))
     rel = (ty - wy) / bbox_diagonal
@@ -472,16 +619,23 @@ class PoseStateTracker:
     Stateful tracker for live/video use.
 
     Motion is smoothed over several frames and posture is majority-voted.
-    Missing pose resets the temporal chain so a reappearing dog cannot create
-    a fake large motion spike.
+    A short run of missed detections (up to MAX_MISSED_FRAMES) is tolerated
+    without resetting prev_kpts/history, since brief detector dropouts are
+    normal during real walking/running and previously caused motion to be
+    reported as "Still" on every recovery frame. Only a longer gap -- the
+    dog genuinely leaving the frame -- resets the temporal chain, so a
+    reappearing dog still can't create a fake large motion spike.
     """
     def __init__(self, motion_history=MOTION_HISTORY,
                  posture_history=POSTURE_HISTORY,
-                 tail_history=TAIL_HISTORY):
+                 tail_history=TAIL_HISTORY,
+                 max_missed_frames=MAX_MISSED_FRAMES):
         self.motion_history = deque(maxlen=motion_history)
         self.posture_history = deque(maxlen=posture_history)
         self.tail_history = deque(maxlen=tail_history)
         self.prev_kpts = None
+        self.max_missed_frames = max_missed_frames
+        self.missed_frames = 0
 
     @staticmethod
     def majority_vote(history):
@@ -492,17 +646,38 @@ class PoseStateTracker:
             counts[value] = counts.get(value, 0) + 1
         return max(counts, key=counts.get)
 
+    @staticmethod
+    def empty_features():
+        """Default feature dict for 'no pose available' -- does NOT touch
+        any tracker's internal state. Use this instead of update(None, None)
+        when you just need a placeholder before deciding whether real
+        keypoints are available; calling update(None, None) is destructive
+        (it resets motion/posture/tail history and prev_kpts)."""
+        return {
+            "motion": {"label": "Unknown", "score": 0.0, "confidence": 0.0},
+            "posture": {"label": "Unknown", "confidence": 0.0},
+            "tail": compute_tail_features(None, None, None),
+            "ears": {"label": "Unknown", "confidence": 0.0},
+            "head": {"label": "Unknown", "confidence": 0.0},
+            "paw": {"label": "None", "confidence": 0.0},
+        }
+
     def update(self, kpts, bbox_diagonal):
         if kpts is None:
-            self.reset()
-            return {
-                "motion": {"label": "Unknown", "score": 0.0, "confidence": 0.0},
-                "posture": {"label": "Unknown", "confidence": 0.0},
-                "tail": compute_tail_features(None, None, None),
-                "ears": {"label": "Unknown", "confidence": 0.0},
-                "head": {"label": "Unknown", "confidence": 0.0},
-                "paw": {"label": "None", "confidence": 0.0},
-            }
+            # A single missed detection (motion blur, brief occlusion, a
+            # confidence dip below threshold) is normal even for a walking
+            # dog. Do NOT wipe prev_kpts/history for that -- doing so forced
+            # classify_motion_from_pose() to treat every recovery frame as
+            # the "first frame ever seen" (Still, score 0.0), which made a
+            # walking dog look permanently Still. Only reset after several
+            # consecutive missed frames, which indicates the dog genuinely
+            # left the frame rather than a one-off detector hiccup.
+            self.missed_frames += 1
+            if self.missed_frames > self.max_missed_frames:
+                self.reset()
+            return self.empty_features()
+
+        self.missed_frames = 0
 
         raw_motion = classify_motion_from_pose(self.prev_kpts, kpts, bbox_diagonal)
         raw_posture = classify_posture(kpts, bbox_diagonal)
@@ -543,6 +718,7 @@ class PoseStateTracker:
         self.posture_history.clear()
         self.tail_history.clear()
         self.prev_kpts = None
+        self.missed_frames = 0
 
 
 PoseTracker = PoseStateTracker

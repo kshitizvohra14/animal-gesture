@@ -57,8 +57,8 @@ from motion import to_gray_small, classify_motion
 from pose_motion import (load_pose_model, extract_keypoints, classify_motion_from_pose,
                           classify_posture, compute_tail_low, PoseStateTracker)
 from wellness_alerts import WellnessTracker
-from audio import classify_vocalization, decode_pcm16_base64
-from fusion import fuse
+from audio import classify_vocalization, decode_pcm16_base64, get_status as get_audio_status
+from fusion import fuse, resolve_final_emotion
 from dog_detector import load_dog_detector, detect_dog, crop_dog
 
 # IMPORTANT: the dog gate runs BEFORE the dog-emotion model.
@@ -287,7 +287,7 @@ def predict(payload: PredictRequest, request: Request):
     # --- motion + posture + temporal pose behavior cues ---
     posture_result = {"label": "Unknown", "confidence": 0.0}
     curr_kpts, bbox_diag = None, None
-    pose_features = state["pose_tracker"].update(None, None)
+    pose_features = PoseStateTracker.empty_features()
 
     if pose_model is not None:
         pose_res = extract_keypoints(pose_model, frame_for_model)
@@ -320,6 +320,13 @@ def predict(payload: PredictRequest, request: Request):
     fused = fuse(fused_emotion_label, emotion_conf, motion_result["label"],
                  vocalization_label, vocal_conf, pose_cues)
 
+    # --- correct the displayed emotion using pose/behavior counter-evidence
+    #     (a wagging tail + standing/walking dog cannot plausibly be Sad) ---
+    display_label, display_conf, overridden, override_reason = resolve_final_emotion(
+        canonical_emotion, emotion_conf, emotion_is_confident, fused,
+        motion_result["label"], posture_result["label"],
+    )
+
     # --- temporal smoothing: displayed gesture is the mode of recent raw gestures ---
     state["gesture_history"].append(fused["gesture"])
     smoothed_gesture = Counter(state["gesture_history"]).most_common(1)[0][0]
@@ -337,10 +344,12 @@ def predict(payload: PredictRequest, request: Request):
         "is_trained": is_trained,
         "pose_active": pose_model is not None,
         "emotion": {
-            "label": canonical_emotion,
+            "label": display_label,
             "raw_label": raw_emotion_label,
-            "confidence": emotion_conf,
+            "confidence": display_conf,
             "confident": emotion_is_confident,
+            "overridden": overridden,
+            "override_reason": override_reason,
             "all": [{"label": FOLDER_TO_EMOTION.get(l.lower(), l), "confidence": c} for l, c in ranked],
         },
         "motion": motion_result,
@@ -436,7 +445,7 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
     posture_result = {"label": "Unknown", "confidence": 0.0}
     curr_kpts, bbox_diag = None, None
     image_pose_tracker = PoseStateTracker()
-    pose_features = image_pose_tracker.update(None, None)
+    pose_features = PoseStateTracker.empty_features()
 
     if pose_model is not None:
         pose_res = extract_keypoints(pose_model, dog_frame)
@@ -463,6 +472,13 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
         pose_cues,
     )
 
+    # --- correct the displayed emotion using pose/behavior counter-evidence
+    #     (a wagging tail + standing dog cannot plausibly be Sad) ---
+    display_label, display_conf, overridden, override_reason = resolve_final_emotion(
+        canonical_emotion, emotion_conf, emotion_is_confident, fused,
+        motion_result["label"], posture_result["label"],
+    )
+
     gesture_name = fused["gesture"]
     if not fused["matched_rule"]:
         posture = posture_result.get("label", "Unknown")
@@ -474,10 +490,11 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
             "Relaxed": f"Calm and resting{posture_suffix}",
             "Sad": f"Quiet and withdrawn{posture_suffix}",
             "Angry": f"Alert / watchful stance{posture_suffix}",
+            "Uncertain": f"Hard to read from this frame{posture_suffix}",
         }
         gesture_name = descriptive_map.get(
-            canonical_emotion,
-            f"{canonical_emotion} pet state{posture_suffix}",
+            display_label,
+            f"{display_label} pet state{posture_suffix}",
         )
 
     annotated_b64 = annotate_pose(dog_frame, curr_kpts)
@@ -492,10 +509,12 @@ def process_single_image(frame_bgr: np.ndarray) -> dict:
         "is_trained": is_trained,
         "pose_active": pose_model is not None,
         "emotion": {
-            "label": canonical_emotion,
+            "label": display_label,
             "raw_label": raw_emotion_label,
-            "confidence": float(emotion_conf),
+            "confidence": float(display_conf),
             "confident": bool(emotion_is_confident),
+            "overridden": overridden,
+            "override_reason": override_reason,
             "all": [
                 {
                     "label": str(FOLDER_TO_EMOTION.get(l.lower(), l)),
@@ -564,6 +583,19 @@ VIDEO_AUDIO_CHANNELS = 1
 VIDEO_AUDIO_WINDOW_SECONDS = 1.0
 
 
+def get_ffmpeg_executable() -> str:
+    """Find a usable ffmpeg executable, preferring bundled imageio-ffmpeg."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:
+        pass
+    import shutil
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
 def extract_video_audio_pcm(video_path: str):
     """
     Extract the uploaded video's audio as mono 16-kHz signed PCM.
@@ -572,8 +604,9 @@ def extract_video_audio_pcm(video_path: str):
     NumPy array is suitable for the existing YAMNet classify_vocalization()
     function in audio.py.
     """
+    ffmpeg_bin = get_ffmpeg_executable()
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        ffmpeg_bin, "-hide_banner", "-loglevel", "error",
         "-i", video_path,
         "-vn",
         "-ac", str(VIDEO_AUDIO_CHANNELS),
@@ -605,6 +638,40 @@ def extract_video_audio_pcm(video_path: str):
 
     waveform = pcm.astype(np.float32) / 32768.0
     return waveform, None
+
+
+def decode_audio_file(audio_path: str):
+    """
+    Decode an audio file (.mp3, .wav, .m4a, .ogg, .flac, etc.) to 16-kHz mono float32.
+    Tries librosa first, then ffmpeg.
+    """
+    try:
+        import librosa
+        waveform, _ = librosa.load(audio_path, sr=VIDEO_AUDIO_SAMPLE_RATE, mono=True)
+        waveform = np.asarray(waveform, dtype=np.float32)
+        waveform = np.clip(waveform, -1.0, 1.0)
+        return waveform, None
+    except Exception as librosa_err:
+        ffmpeg_bin = get_ffmpeg_executable()
+        cmd = [
+            ffmpeg_bin, "-hide_banner", "-loglevel", "error",
+            "-i", audio_path,
+            "-vn",
+            "-ac", str(VIDEO_AUDIO_CHANNELS),
+            "-ar", str(VIDEO_AUDIO_SAMPLE_RATE),
+            "-f", "s16le",
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if proc.returncode == 0 and proc.stdout:
+                pcm = np.frombuffer(proc.stdout, dtype=np.int16)
+                if pcm.size > 0:
+                    waveform = pcm.astype(np.float32) / 32768.0
+                    return waveform, None
+        except Exception:
+            pass
+        return None, f"Could not decode audio: {librosa_err}"
 
 
 def classify_video_audio_at_time(waveform, timestamp_seconds: float):
@@ -657,13 +724,23 @@ def classify_video_audio_at_time(waveform, timestamp_seconds: float):
                 "raw_top_class": "",
             }
 
+        # BUG: this used to hard-code "available": True regardless of what
+        # classify_vocalization() actually reported. When YAMNet failed to
+        # load (no network access to tfhub.dev, missing tensorflow_hub,
+        # etc.), classify_vocalization() correctly returns
+        # {"label": "Quiet", "available": False, ...} -- but this wrapper
+        # was silently overwriting that to "available": True, so the UI
+        # displayed "Quiet" as if it had genuinely listened and heard
+        # nothing, permanently masking the real failure. Propagate the
+        # actual availability instead.
+        available = bool(result.get("available", False))
         return {
-            "label": str(result.get("label", "Unknown")),
+            "label": str(result.get("label", "Unknown")) if available else "Audio unavailable",
             "confidence": (
                 float(result["confidence"])
-                if result.get("confidence") is not None else None
+                if available and result.get("confidence") is not None else None
             ),
-            "available": True,
+            "available": available,
             "raw_top_class": str(result.get("raw_top_class", "")),
         }
     except Exception as exc:
@@ -767,11 +844,27 @@ async def handle_video_upload(target: UploadFile):
                 prev_gray = None
                 gesture_history.clear()
 
-                # Audio is still classified independently of visual dog
-                # detection, but it must not be fused into a dog gesture.
+                # Audio is classified independently of visual dog detection,
+                # and (unlike before) IS counted into the running totals here
+                # too -- a bark on a frame where the dog isn't visually
+                # detected (motion blur, bad angle, cropped out) is still a
+                # real bark and must not be silently dropped from
+                # audio_counts/vocal_confidences/audio_events.
                 audio_result = classify_video_audio_at_time(
                     audio_waveform, timestamp
                 )
+                vocalization_label = audio_result["label"]
+                vocal_conf = audio_result["confidence"]
+
+                if audio_result.get("available"):
+                    audio_counts[vocalization_label] += 1
+                    if vocal_conf is not None:
+                        vocal_confidences.append(vocal_conf)
+                    if vocalization_label not in {
+                        "Quiet", "Unknown", "Audio unavailable",
+                        "No audio track", "Audio error"
+                    }:
+                        audio_events += 1
 
                 frame_results.append({
                     "frame": int(frame_number),
@@ -816,7 +909,7 @@ async def handle_video_upload(target: UploadFile):
             # ---------- POSE / MOTION / POSTURE ----------
             curr_kpts = None
             bbox_diag = None
-            pose_features = pose_tracker.update(None, None)
+            pose_features = PoseStateTracker.empty_features()
 
             if pose_model is not None:
                 pose_res = extract_keypoints(pose_model, dog_frame)
@@ -865,6 +958,14 @@ async def handle_video_upload(target: UploadFile):
                 pose_cues,
             )
 
+            # --- correct the displayed emotion using pose/behavior
+            #     counter-evidence (wagging tail + active posture/motion
+            #     cannot plausibly be Sad) ---
+            display_label, display_conf, overridden, override_reason = resolve_final_emotion(
+                canonical_emotion, emotion_conf, emotion_is_confident, fused,
+                motion_result["label"], posture_result["label"],
+            )
+
             raw_gesture = fused["gesture"]
 
             if not fused["matched_rule"]:
@@ -879,11 +980,12 @@ async def handle_video_upload(target: UploadFile):
                     "Relaxed": f"Calm and resting{posture_suffix}",
                     "Sad": f"Quiet and withdrawn{posture_suffix}",
                     "Angry": f"Alert / watchful stance{posture_suffix}",
+                    "Uncertain": f"Hard to read from this frame{posture_suffix}",
                 }
 
                 raw_gesture = desc_map.get(
-                    canonical_emotion,
-                    f"{canonical_emotion} pet state{posture_suffix}",
+                    display_label,
+                    f"{display_label} pet state{posture_suffix}",
                 )
 
             gesture_history.append(raw_gesture)
@@ -899,10 +1001,12 @@ async def handle_video_upload(target: UploadFile):
                 "dog_bbox": presence.get("bbox"),
 
                 "emotion": {
-                    "label": str(canonical_emotion),
+                    "label": str(display_label),
                     "raw_label": str(raw_emotion_label),
-                    "confidence": float(emotion_conf),
+                    "confidence": float(display_conf),
                     "confident": bool(emotion_is_confident),
+                    "overridden": overridden,
+                    "override_reason": override_reason,
                 },
 
                 "motion": {
@@ -936,6 +1040,18 @@ async def handle_video_upload(target: UploadFile):
 
         valid = [r for r in frame_results if r["dog_present"]]
 
+        # Audio summary uses the GLOBAL audio_counts (every sampled frame,
+        # dog visually detected or not) -- not gated by the visual dog gate.
+        # A bark is real even on a frame where the dog wasn't visually
+        # detected (motion blur, bad angle, cropped out of frame), and
+        # gating the audio summary on dog_present silently dropped those
+        # here before.
+        final_audio = (
+            audio_counts.most_common(1)[0][0]
+            if audio_counts else
+            ("No audio track" if not audio_available else "Unknown")
+        )
+
         if valid:
             gesture_counts = Counter(r["gesture"] for r in valid)
             emotion_counts = Counter(r["emotion"]["label"] for r in valid)
@@ -951,12 +1067,6 @@ async def handle_video_upload(target: UploadFile):
             final_emotion = emotion_counts.most_common(1)[0][0]
             final_motion = motion_counts.most_common(1)[0][0]
             final_posture = posture_counts.most_common(1)[0][0]
-
-            final_audio = (
-                dog_audio_counts.most_common(1)[0][0]
-                if dog_audio_counts else
-                ("No audio track" if not audio_available else "Unknown")
-            )
         else:
             gesture_counts = Counter()
             emotion_counts = Counter()
@@ -968,9 +1078,6 @@ async def handle_video_upload(target: UploadFile):
             final_emotion = "Unknown"
             final_motion = "Unknown"
             final_posture = "Unknown"
-            final_audio = (
-                "No audio track" if not audio_available else "Unknown"
-            )
 
         return {
             "success": True,
@@ -1063,13 +1170,139 @@ async def handle_video_upload(target: UploadFile):
                 pass
 
 
+async def handle_audio_upload(target: UploadFile):
+    """Core handler for uploaded standalone audio files (.mp3, .wav, .m4a, etc.)."""
+    allowed_exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma"}
+    filename = target.filename or "audio_upload.mp3"
+    ext = Path(filename).suffix.lower()
+    ct = (target.content_type or "").lower()
+
+    if ext not in allowed_exts and not ct.startswith("audio/"):
+        return JSONResponse(
+            {"error": f"Unsupported audio format ({ext}). Supported formats: MP3, WAV, M4A, OGG, FLAC, AAC."},
+            status_code=400,
+        )
+
+    temp_path = None
+    try:
+        content = await target.read()
+        if not content:
+            return JSONResponse({"error": "Uploaded audio file is empty."}, status_code=400)
+
+        with tempfile.NamedTemporaryFile(suffix=ext or ".mp3", delete=False) as tmp:
+            tmp.write(content)
+            temp_path = tmp.name
+
+        waveform, err = decode_audio_file(temp_path)
+        if waveform is None or waveform.size == 0:
+            return JSONResponse({"error": f"Could not decode audio: {err or 'no audio samples detected'}"}, status_code=400)
+
+        duration = float(waveform.size) / VIDEO_AUDIO_SAMPLE_RATE
+        result = classify_vocalization(waveform)
+        vocal_label = result.get("label", "Quiet")
+        confidence = float(result.get("confidence", 0.0))
+
+        vocal_behavior_map = {
+            "Barking": ("Alert / Playful", "Barking detected - dog may be excited, alert, or calling for attention."),
+            "Growling": ("Angry / Guarding", "Growling detected - dog is displaying defensive or agitated behavior."),
+            "Whimpering": ("Sad / Whimpering", "Whimpering detected - dog may be in distress, anxious, or seeking comfort."),
+            "Howling": ("Sad / Howling", "Howling detected - dog may be calling, vocalizing, or feeling lonely."),
+            "Quiet": ("Relaxed / Quiet", "Quiet / no prominent canine vocalization detected in this clip."),
+        }
+        display_emotion, desc = vocal_behavior_map.get(
+            vocal_label,
+            ("Uncertain", f"Canine vocalization: {vocal_label}")
+        )
+
+        all_classes = ["Barking", "Whimpering", "Growling", "Howling", "Quiet"]
+        vocal_bars = []
+        for cls in all_classes:
+            if cls == vocal_label:
+                vocal_bars.append({"label": cls, "confidence": round(confidence, 3)})
+            else:
+                rem = max(0.01, round((1.0 - confidence) / (len(all_classes) - 1), 3))
+                vocal_bars.append({"label": cls, "confidence": rem})
+        vocal_bars.sort(key=lambda x: x["confidence"], reverse=True)
+
+        return {
+            "success": True,
+            "type": "audio",
+            "filename": filename,
+            "duration": round(duration, 2),
+            "dog_present": True,
+            "dog_gate_active": False,
+            "dog_confidence": round(max(0.6, confidence), 2) if vocal_label != "Quiet" else 0.5,
+            "is_trained": is_trained,
+            "pose_active": pose_model is not None,
+            "emotion": {
+                "label": display_emotion,
+                "raw_label": vocal_label,
+                "confidence": round(confidence, 3),
+                "confident": bool(confidence >= 0.25),
+                "overridden": True,
+                "override_reason": desc,
+                "all": vocal_bars,
+            },
+            "motion": {"label": "Audio only (No video)", "score": 0.0, "confidence": 0.0},
+            "posture": {"label": "Audio only (No video)", "confidence": 0.0},
+            "vocalization": {
+                "label": vocal_label,
+                "confidence": round(confidence, 3),
+                "raw_top_class": result.get("raw_top_class", ""),
+                "available": bool(result.get("available", True)),
+                "fresh": True,
+            },
+            "gesture": f"Vocalization: {vocal_label}",
+            "gesture_raw": vocal_label,
+            "fusion_score": round(confidence, 2),
+            "alerts": [
+                {
+                    "severity": "critical" if vocal_label == "Growling" else ("watch" if vocal_label in ["Whimpering", "Howling"] else "info"),
+                    "message": desc,
+                }
+            ] if vocal_label != "Quiet" else [],
+            "audio": {
+                "duration_seconds": round(duration, 2),
+                "sample_rate": VIDEO_AUDIO_SAMPLE_RATE,
+                "label": vocal_label,
+                "confidence": round(confidence, 3),
+                "raw_top_class": result.get("raw_top_class", ""),
+            }
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse({"error": f"Failed to process audio: {exc}"}, status_code=500)
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _is_valid_upload(target) -> bool:
+    return target is not None and bool(getattr(target, "filename", None))
+
+
+@app.post("/predict_audio_file")
+async def predict_audio_file(
+    file: UploadFile = File(None),
+    audio: UploadFile = File(None),
+):
+    """Run vocalization detection on an uploaded audio file (.mp3, .wav, etc.)."""
+    target = file if _is_valid_upload(file) else (audio if _is_valid_upload(audio) else None)
+    if not target:
+        return JSONResponse({"error": "No audio file provided."}, status_code=400)
+    return await handle_audio_upload(target)
+
+
 @app.post("/predict_image")
 async def predict_image(
     file: UploadFile = File(None),
     image: UploadFile = File(None),
 ):
     """Run gesture recognition on an uploaded pet image."""
-    target = file if isinstance(file, UploadFile) else (image if isinstance(image, UploadFile) else None)
+    target = file if _is_valid_upload(file) else (image if _is_valid_upload(image) else None)
     if not target:
         return JSONResponse({"error": "No image file provided."}, status_code=400)
     return await handle_image_upload(target)
@@ -1081,7 +1314,7 @@ async def predict_video(
     file: UploadFile = File(None),
 ):
     """Run the visual fusion pipeline on an uploaded video."""
-    target = video if isinstance(video, UploadFile) else (file if isinstance(file, UploadFile) else None)
+    target = video if _is_valid_upload(video) else (file if _is_valid_upload(file) else None)
     if not target:
         return JSONResponse({"error": "No video file provided."}, status_code=400)
     return await handle_video_upload(target)
@@ -1091,22 +1324,47 @@ async def predict_video(
 async def upload_media(
     file: UploadFile = File(...),
 ):
-    """Unified endpoint to analyze an uploaded image or video."""
+    """Unified endpoint to analyze an uploaded image, video, or audio file."""
     filename = file.filename or ""
     ext = Path(filename).suffix.lower()
     ct = (file.content_type or "").lower()
     image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    audio_exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".wma"}
 
     if ext in image_exts or ct.startswith("image/"):
         return await handle_image_upload(file)
     elif ext in video_exts or ct.startswith("video/"):
         return await handle_video_upload(file)
+    elif ext in audio_exts or ct.startswith("audio/"):
+        return await handle_audio_upload(file)
     else:
         return JSONResponse(
-            {"error": f"Unsupported file format '{ext or ct}'. Please upload an image (JPG, PNG, WEBP) or video (MP4, MOV, WEBM)."},
+            {"error": f"Unsupported file format '{ext or ct}'. Please upload an image (JPG, PNG, WEBP), video (MP4, MOV, WEBM), or audio (MP3, WAV, OGG, M4A)."},
             status_code=400,
         )
+
+
+@app.get("/audio_status")
+async def audio_status():
+    """
+    Diagnostic endpoint: is YAMNet actually loaded on this server?
+
+    Hits classify_vocalization() with a throwaway silent buffer first (this
+    triggers the lazy _load() in audio.py if it hasn't run yet, same as a
+    real request would), then reports audio.get_status() -- whether the
+    model loaded, and if not, the exact underlying error (missing
+    tensorflow_hub package vs. a blocked/failed request to tfhub.dev vs.
+    something else). This is what distinguishes "the model works but this
+    clip was quiet" from "the model never loaded, so nothing is ever
+    detected" -- which otherwise look identical from the UI.
+    """
+    import numpy as np
+    try:
+        classify_vocalization(np.zeros(16000, dtype=np.float32))
+    except Exception:
+        pass
+    return get_audio_status()
 
 
 @app.post("/predict_audio")

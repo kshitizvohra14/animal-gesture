@@ -13,7 +13,7 @@ from pose_motion import (
 # CONFIG
 # ============================================================
 
-VIDEO_PATH = "test2.mp4"
+VIDEO_PATH = "test.mp4"
 
 # For webcam:
 # VIDEO_PATH = 0
@@ -72,7 +72,7 @@ def draw_info(
 
     motion = state["motion"]
     posture = state["posture"]
-    tail_low = state["tail_low"]
+    tail_low = state["tail"]["low"]
 
     # --------------------------------------------------------
     # Panel
@@ -358,7 +358,7 @@ def main():
                 f"Motion={motion['label']:8s} "
                 f"Score={motion['score']:.4f} | "
                 f"Posture={posture['label']:8s} | "
-                f"TailLow={state['tail_low']} | "
+                f"TailLow={state['tail']['low']} | "
                 f"YOLO={pose_confidence:.2f}"
             )
 

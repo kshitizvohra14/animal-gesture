@@ -12,13 +12,28 @@ audio-decoding library like ffmpeg/pydub is needed here).
 """
 
 import csv
+import time
+import traceback
 import numpy as np
 import tensorflow as tf
 # tensorflow_hub is imported lazily in _load to allow test stubs without requiring the package.
 
 _yamnet_model = None
 _class_names = None
-_load_failed = False  # sticky: once loading fails, stop retrying every request
+_load_failed = False  # set on failure, but retried after _RETRY_COOLDOWN_SECONDS
+_last_load_attempt = 0.0
+_last_load_error = None
+
+# How long to wait before retrying a failed load. YAMNet's first load
+# downloads ~15MB from https://tfhub.dev, which fails if that request
+# happens during a transient network hiccup (or before the network/proxy is
+# up on the host). Previously a single failed attempt set _load_failed
+# permanently for the process lifetime, so vocalization silently returned
+# "Quiet"/unavailable forever afterward, even once the network was fine
+# again -- indistinguishable from a real (but misleading) "model unavailable"
+# state until the server was manually restarted. Retrying periodically
+# instead means a transient failure self-heals.
+_RETRY_COOLDOWN_SECONDS = 60
 
 # AudioSet class names (from YAMNet's class map) relevant to dog vocalization.
 # Anything not in this set is treated as "Quiet" for this prototype, since we
@@ -44,26 +59,55 @@ MIN_VOCAL_SCORE = 0.10
 
 
 def _load():
-    """Loads YAMNet once. On failure, sets _load_failed so callers can
-    surface that distinctly from 'the room is quiet' — see classify_vocalization()."""
-    global _yamnet_model, _class_names, _load_failed
-    if _yamnet_model is not None or _load_failed:
+    """Loads YAMNet once. On failure, retries after _RETRY_COOLDOWN_SECONDS
+    instead of failing permanently -- see classify_vocalization()."""
+    global _yamnet_model, _class_names, _load_failed, _last_load_attempt, _last_load_error
+    if _yamnet_model is not None:
         return
+    if _load_failed and (time.time() - _last_load_attempt) < _RETRY_COOLDOWN_SECONDS:
+        return
+
+    _last_load_attempt = time.time()
     try:
-        print("[audio.py] loading YAMNet (first call only, downloads ~15MB)...")
+        print("[audio.py] loading YAMNet (downloads ~15MB from tfhub.dev on first success)...")
         # Import tensorflow_hub lazily to avoid ImportError when the package is not installed.
         try:
             import tensorflow_hub as hub
         except ImportError as hub_exc:
-            raise ImportError("tensorflow_hub is required for audio processing") from hub_exc
+            raise ImportError(
+                "tensorflow_hub is not installed -- run: pip install tensorflow-hub"
+            ) from hub_exc
         _yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
         class_map_path = _yamnet_model.class_map_path().numpy().decode("utf-8")
         with tf.io.gfile.GFile(class_map_path) as f:
             reader = csv.DictReader(f)
             _class_names = [row["display_name"] for row in reader]
+        _load_failed = False
+        _last_load_error = None
+        print("[audio.py] YAMNet loaded successfully.")
     except Exception as exc:
+        # Print the full traceback, not just str(exc) -- "failed to load"
+        # alone doesn't tell you whether it's a missing package, a blocked
+        # network request to tfhub.dev, or something else entirely, and
+        # those need different fixes.
+        traceback.print_exc()
         print(f"[audio.py] YAMNet failed to load: {exc}")
+        _yamnet_model = None
         _load_failed = True
+        _last_load_error = str(exc)
+
+
+def get_status() -> dict:
+    """Diagnostic snapshot -- e.g. for a /health endpoint or manual check."""
+    return {
+        "loaded": _yamnet_model is not None,
+        "load_failed": _load_failed,
+        "last_error": _last_load_error,
+        "seconds_until_retry": (
+            max(0.0, _RETRY_COOLDOWN_SECONDS - (time.time() - _last_load_attempt))
+            if _load_failed else 0.0
+        ),
+    }
 
 
 def classify_vocalization(waveform: np.ndarray, top_k: int = 5) -> dict:

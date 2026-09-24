@@ -438,35 +438,39 @@ GESTURES = [
     BehaviorRule(
         name="Alert / warning bark",
         required_emotion="Angry",
-        emotion_weights={"Angry": 0.8},
+        emotion_weights={"Angry": 0.8, "Uncertain": 0.5},
         positive={
-            "barking": 1.2,
-            "standing": 0.5,
-            "ears_forward": 0.7,
+            "barking": 1.5,
+            "standing": 0.6,
+            "ears_forward": 0.6,
         },
         negative={
             "whimpering": 0.8,
+            "tail_wagging": 0.7,
             "lying": 0.6,
         },
-        min_evidence=2,
-        threshold=0.62,
+        min_evidence=1,
+        threshold=0.48,
     ),
 
     BehaviorRule(
         name="Defensive growl",
         required_emotion="Angry",
-        emotion_weights={"Angry": 0.8},
+        emotion_weights={"Angry": 0.9, "Uncertain": 0.5},
         positive={
-            "growling": 1.2,
-            "tail_raised": 0.7,
-            "standing": 0.4,
+            "growling": 1.5,
+            "standing": 0.6,
+            "still": 0.4,
+            "ears_forward": 0.5,
+            "tail_raised": 0.6,
         },
         negative={
-            "tail_low": 0.7,
-            "whimpering": 0.7,
+            "whimpering": 0.8,
+            "tail_wagging": 0.9,
+            "lying": 0.8,
         },
-        min_evidence=2,
-        threshold=0.62,
+        min_evidence=1,
+        threshold=0.48,
     ),
 
     BehaviorRule(
@@ -1143,6 +1147,7 @@ class FusionEngine:
         return {
             "gesture": best_rule.name,
             "matched_rule": True,
+            "matched_emotion": best_rule.required_emotion,
 
             "score": round(
                 final_confidence,
@@ -1225,6 +1230,11 @@ class FusionEngine:
             ),
 
             "matched_rule": False,
+            "matched_emotion": (
+                best_rule.required_emotion
+                if best_rule
+                else None
+            ),
 
             "score": 0.0,
             "match_score": (
@@ -1406,6 +1416,74 @@ _engine = FusionEngine(
     threshold=0.60,
     contradiction_penalty=0.35,
 )
+
+
+def resolve_final_emotion(
+    canonical_emotion,
+    emotion_conf,
+    emotion_is_confident,
+    fused,
+    motion_label,
+    posture_label,
+):
+    """
+    Correct the displayed emotion using strong, unambiguous behavioral
+    counter-evidence, instead of blindly trusting a single-frame,
+    appearance-only image classifier.
+
+    This closes a gap where fuse()/GestureEngine.select() computed a
+    gesture and contradiction evidence (e.g. tail_wagging contradicting a
+    "Sad" rule), but nothing ever fed that back into the emotion label the
+    UI actually shows -- so a dog standing/walking with an actively
+    wagging tail could still be displayed as "Sad" forever, no matter how
+    much pose evidence disagreed with the CNN's guess for that one frame.
+
+    Returns (label, confidence, overridden: bool, reason: str | None).
+    """
+    base_label = canonical_emotion if emotion_is_confident else "Uncertain"
+    base_conf = float(emotion_conf)
+
+    if not fused:
+        return base_label, base_conf, False, None
+
+    active_cues = set(fused.get("active_cues") or [])
+
+    # A dog can't plausibly be read as Sad/Angry in a frame where its tail
+    # is actively wagging AND it's standing, sitting, walking or running --
+    # and isn't simultaneously whimpering or growling (which would be
+    # genuine corroborating distress/aggression evidence, not a
+    # contradiction).
+    strong_positive_behavior = (
+        "tail_wagging" in active_cues
+        and (
+            motion_label in ("Walking", "Running")
+            or posture_label in ("Standing", "Sitting")
+        )
+        and "whimpering" not in active_cues
+        and "growling" not in active_cues
+    )
+
+    if strong_positive_behavior and base_label in ("Sad", "Angry"):
+        matched_emotion = fused.get("matched_emotion")
+        if fused.get("matched_rule") and matched_emotion in ("Happy", "Relaxed"):
+            return (
+                matched_emotion,
+                float(fused.get("confidence", base_conf)),
+                True,
+                f"overridden by matched behavior '{fused.get('gesture')}'",
+            )
+        # No single positive gesture rule cleared its threshold, but the
+        # raw label is still clearly contradicted by tail-wagging + active
+        # posture -- showing a confidently wrong Sad/Angry is worse than
+        # admitting uncertainty.
+        return (
+            "Uncertain",
+            base_conf,
+            True,
+            "raw emotion contradicted by tail-wagging + active posture/motion",
+        )
+
+    return base_label, base_conf, False, None
 
 
 def fuse(

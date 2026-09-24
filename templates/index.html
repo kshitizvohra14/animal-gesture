@@ -560,7 +560,7 @@
         <span>📹</span> Live Camera & Mic
       </button>
       <button class="tab-btn" id="tabUpload">
-        <span>📁</span> Upload Media (Image / Video)
+        <span>📁</span> Upload Media (Image / Video / Audio)
       </button>
     </div>
 
@@ -599,11 +599,11 @@
 
         <!-- 2. Upload Dropzone Container -->
         <div id="uploadDropzone" class="dropzone-container" style="display:none;">
-          <input type="file" id="mediaFileInput" accept="image/*,video/*" style="display:none;" />
-          <div class="dz-icon">🐕</div>
-          <div class="dz-title">Drop pet photo or video here</div>
+          <input type="file" id="mediaFileInput" accept="image/*,video/*,audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac" style="display:none;" />
+          <div class="dz-icon">🐕 🎵</div>
+          <div class="dz-title">Drop pet photo, video, or audio here</div>
           <div class="dz-sub">or <span class="browse-link" id="browseLink">click to browse</span></div>
-          <div class="dz-pill">Images: JPG, PNG, WEBP · Videos: MP4, MOV, WEBM</div>
+          <div class="dz-pill">Images: JPG, PNG · Videos: MP4, MOV · Audio: MP3, WAV, OGG</div>
         </div>
 
         <!-- 3. Upload Media Preview Container -->
@@ -613,6 +613,13 @@
           </div>
           <img id="imagePreview" class="feed-media" alt="Uploaded Pet Photo" style="display:none;" />
           <video id="videoPreview" class="feed-media" controls playsinline style="display:none;"></video>
+          <!-- Audio Preview Card -->
+          <div id="audioPreviewCard" style="display:none; width:100%; min-height:360px; flex-direction:column; align-items:center; justify-content:center; padding:32px 20px; text-align:center;">
+            <div style="font-size:56px; margin-bottom:12px; filter:drop-shadow(0 4px 12px rgba(0,0,0,0.5));">🎙️</div>
+            <div id="audioFileName" style="font-size:16px; font-weight:600; color:var(--paper); margin-bottom:6px; font-family:'JetBrains Mono', monospace; word-break:break-all;"></div>
+            <div id="audioFileMeta" style="font-size:12px; color:var(--muted); font-family:'JetBrains Mono', monospace; margin-bottom:20px;"></div>
+            <audio id="audioPlayer" controls style="width:100%; max-width:380px; outline:none; border-radius:30px;"></audio>
+          </div>
         </div>
 
         <!-- Tag Overlay -->
@@ -700,6 +707,10 @@
     const browseLink = document.getElementById('browseLink');
     const imagePreview = document.getElementById('imagePreview');
     const videoPreview = document.getElementById('videoPreview');
+    const audioPreviewCard = document.getElementById('audioPreviewCard');
+    const audioPlayer = document.getElementById('audioPlayer');
+    const audioFileName = document.getElementById('audioFileName');
+    const audioFileMeta = document.getElementById('audioFileMeta');
     const btnChangeMedia = document.getElementById('btnChangeMedia');
     const btnAnalyze = document.getElementById('btnAnalyze');
     const btnLiveAnalyze = document.getElementById('btnLiveAnalyze');
@@ -719,6 +730,7 @@
     let videoLiveTimer = null;       // setInterval handle for video frame capture
     let videoFrameCount = 0;         // frames analyzed in current live session
     let videoIsImage = false;        // tracks whether selected upload is an image
+    let uploadIsAudio = false;       // tracks whether selected upload is an audio file
 
     const SEVERITY_STYLE = { watch: "warning", info: "info", critical: "critical" };
     const SEVERITY_TAG = { watch: "⚠ Worth watching", info: "ⓘ Notice", critical: "⚠ Alert" };
@@ -873,6 +885,11 @@
         videoPreview.pause();
         videoPreview.removeAttribute('src');
       }
+      audioPreviewCard.style.display = 'none';
+      if (audioPlayer.src) {
+        audioPlayer.pause();
+        audioPlayer.removeAttribute('src');
+      }
       uploadDropzone.style.display = 'flex';
       uploadPreviewContainer.style.display = 'none';
       btnAnalyze.disabled = true;
@@ -883,7 +900,7 @@
       uploadFileInfo.textContent = '';
       videoBreakdown.style.display = 'none';
       topLabel.textContent = 'Upload File';
-      topConf.textContent = 'select image or video';
+      topConf.textContent = 'select image, video, or audio';
       gestureValue.textContent = '—';
       motionVal.textContent = '—';
       postureVal.textContent = '—';
@@ -898,14 +915,19 @@
 
       selectedFile = file;
       const isVideo = file.type.startsWith('video/') || /\.(mp4|mov|avi|webm|mkv)$/i.test(file.name);
-      videoIsImage = !isVideo;
+      const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|flac|aac|wma)$/i.test(file.name);
+      const isImage = !isVideo && !isAudio;
+      videoIsImage = isImage;
+      uploadIsAudio = isAudio;
+
+      const fileTypeLabel = isVideo ? 'Video' : (isAudio ? 'Audio' : 'Image');
       const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
-      uploadFileInfo.textContent = `Selected: ${file.name} (${sizeMb} MB) — ${isVideo ? 'Video' : 'Image'}`;
+      uploadFileInfo.textContent = `Selected: ${file.name} (${sizeMb} MB) — ${fileTypeLabel}`;
 
       uploadDropzone.style.display = 'none';
       uploadPreviewContainer.style.display = 'flex';
       btnAnalyze.disabled = false;
-      btnAnalyze.textContent = isVideo ? 'Batch Analyze' : 'Analyze Image';
+      btnAnalyze.textContent = isVideo ? 'Batch Analyze' : (isAudio ? 'Analyze Audio' : 'Analyze Image');
       videoBreakdown.style.display = 'none';
       frameCounter.textContent = '';
 
@@ -919,22 +941,35 @@
       const objUrl = URL.createObjectURL(file);
       if (isVideo) {
         imagePreview.style.display = 'none';
+        audioPreviewCard.style.display = 'none';
         videoPreview.style.display = 'block';
         videoPreview.src = objUrl;
         videoPreview.loop = true;  // loop so live analysis can run continuously
         videoPreview.muted = true;
-      } else {
+      } else if (isAudio) {
+        imagePreview.style.display = 'none';
         videoPreview.style.display = 'none';
         if (videoPreview.src) videoPreview.pause();
+        audioPreviewCard.style.display = 'flex';
+        audioPlayer.src = objUrl;
+        audioFileName.textContent = file.name;
+        audioFileMeta.textContent = `${sizeMb} MB · Canine Audio Clip`;
+      } else {
+        videoPreview.style.display = 'none';
+        audioPreviewCard.style.display = 'none';
+        if (videoPreview.src) videoPreview.pause();
+        if (audioPlayer.src) audioPlayer.pause();
         imagePreview.style.display = 'block';
         imagePreview.src = objUrl;
       }
 
       topLabel.textContent = 'Ready to Analyze';
-      topConf.textContent = isVideo ? 'Batch Analyze or Live Analyze' : 'click Analyze Image button';
+      topConf.textContent = isVideo
+        ? 'Batch Analyze or Live Analyze'
+        : (isAudio ? 'click Analyze Audio button' : 'click Analyze Image button');
       gestureValue.textContent = '—';
 
-      // Automatically trigger analysis for images
+      // Automatically trigger analysis for images and audio files
       if (!isVideo) {
         analyzeUploadedMedia();
       }
@@ -1001,7 +1036,23 @@
           topConf.textContent = 'Dominant Video Emotion';
           motionVal.textContent = `${fusion.motion || '—'}`;
           postureVal.textContent = `${fusion.posture || '—'}`;
-          vocalVal.textContent = 'N/A (Video)';
+
+          // Reflect the *real* audio result from the backend instead of a
+          // hardcoded placeholder. json.audio.available tells us whether
+          // ffmpeg/YAMNet actually ran; json.audio.error carries the reason
+          // when it didn't (e.g. ffmpeg missing, YAMNet failed to load).
+          const audioInfo = json.audio || {};
+          if (audioInfo.available) {
+            const meanConf = audioInfo.mean_confidence != null
+              ? ` (${Math.round(audioInfo.mean_confidence * 100)}% avg)`
+              : '';
+            vocalVal.textContent = `${fusion.audio || 'Quiet'}${meanConf}`;
+          } else {
+            vocalVal.textContent = audioInfo.error
+              ? `Unavailable — ${audioInfo.error}`
+              : (fusion.audio || 'No audio track');
+          }
+
           gestureValue.textContent = fusion.gesture || '—';
 
           // Render Video Breakdown
@@ -1033,6 +1084,24 @@
             renderBars(emotionList);
           }
           renderAlerts([]);
+        } else if (json.type === 'audio') {
+          // Audio results
+          const vocal = json.vocalization || {};
+          const vocalLabel = vocal.label || 'Quiet';
+          const vocalConf = vocal.confidence != null ? Math.round(vocal.confidence * 100) : 0;
+
+          topLabel.textContent = vocalLabel;
+          topConf.textContent = `${vocalConf}% vocal confidence`;
+          motionVal.textContent = 'Audio file (No video)';
+          postureVal.textContent = 'Audio file (No video)';
+          vocalVal.textContent = `${vocalLabel} (${vocalConf}%)`;
+          gestureValue.textContent = json.gesture || `Vocalization: ${vocalLabel}`;
+
+          if (json.emotion && json.emotion.all) {
+            renderBars(json.emotion.all);
+          }
+          renderAlerts(json.alerts || []);
+          videoBreakdown.style.display = 'none';
         }
 
         btnAnalyze.disabled = false;
@@ -1170,6 +1239,7 @@
     let frameTimer = null;
     let audioCtx = null;
     let processorNode = null;
+    let silentGainNode = null;
     let audioChunks = [];
     let audioTimer = null;
 
@@ -1250,6 +1320,16 @@
         audioChunks.push(downsampleTo16k(input, audioCtx.sampleRate));
       };
       source.connect(processorNode);
+      // A ScriptProcessorNode's onaudioprocess callback only reliably fires
+      // when the node is connected all the way to the graph's destination
+      // -- a dangling node (connected FROM the mic but not connected TO
+      // anything) simply never processes audio in most browsers. Route
+      // through a zero-gain node so the graph is "live" without the user
+      // hearing their own mic played back (which would cause feedback/echo).
+      silentGainNode = audioCtx.createGain();
+      silentGainNode.gain.value = 0;
+      processorNode.connect(silentGainNode);
+      silentGainNode.connect(audioCtx.destination);
       audioTimer = setInterval(sendAudioChunk, 2500);
     }
 
@@ -1284,6 +1364,7 @@
       clearInterval(frameTimer);
       clearInterval(audioTimer);
       if (processorNode) processorNode.disconnect();
+      if (silentGainNode) silentGainNode.disconnect();
       if (audioCtx) audioCtx.close();
       if (video.srcObject) {
         video.srcObject.getTracks().forEach(track => track.stop());
